@@ -1,0 +1,78 @@
+# ==========================================
+# Python & Bytecode
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# ==========================================
+# PyInstaller & Build Outputs
+# ==========================================
+build/
+dist/
+*.manifest
+*.spec.bak
+AltiumDbLibManager.exe
+
+# ==========================================
+# Application Runtime Logs & Local Cache
+# ==========================================
+app.log
+*.log
+.cache/
+
+# User Local Connection & Settings Credentials
+inventree-viewer-settings.json
+
+# ==========================================
+# Microsoft Access Temporary & Lock Files
+# ==========================================
+*.laccdb
+*.ldb
+*.bak
+
+# ==========================================
+# Altium Designer Temporary & Backup Files
+# ==========================================
+History/
+*.Zip
+*.LOG
+*.preview
+__Previews/
+
+# ==========================================
+# External Upstream Libraries (Large Assets)
+# ==========================================
+# The Celestial Altium Library (~2.5 GB) should not be committed directly.
+# Clone or link it separately (see README.md).
+altium-library-master/
+altium-library/
+
+# ==========================================
+# IDEs & Operating System Artifacts
+# ==========================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# ==========================================
+# AI Assistant & Internal Workspace Configs
+# ==========================================
+GEMINI.md
+.gemini/
+

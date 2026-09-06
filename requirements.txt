@@ -1,0 +1,11 @@
+# Altium DbLib Manager Dependencies
+PySide6>=6.5.0
+QtAwesome>=1.3.0
+pyodbc>=5.0.0
+pywin32>=306
+olefile>=0.46
+svgwrite>=1.4.3
+pyaltiumlib>=0.7
+
+# Build and Packaging (optional)
+pyinstaller>=6.0.0
