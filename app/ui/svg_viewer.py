@@ -18,11 +18,24 @@ from .icons import AppIcons
 
 logger = logging.getLogger(__name__)
 
+class _SvgGraphicsView(QGraphicsView):
+    """QGraphicsView that delegates plain mouse wheel scrolling to parent containers."""
+
+    def wheelEvent(self, event: QWheelEvent) -> None:
+        if event.modifiers() == Qt.KeyboardModifier.ControlModifier:
+            # Forward to parent SvgViewer to perform zoom
+            event.ignore()
+        else:
+            # Let parent QScrollArea handle vertical panel scrolling
+            event.ignore()
+
+
 class SvgViewer(QWidget):
     """Interactive SVG viewer with Pan and Zoom for Altium symbols and footprints."""
 
     def __init__(self, title: str = "Preview", parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self.setMinimumHeight(240)
         self.title_text = title
 
         main_layout = QVBoxLayout(self)
@@ -66,7 +79,9 @@ class SvgViewer(QWidget):
 
         # Graphics Scene & View
         self.scene = QGraphicsScene(self)
-        self.view = QGraphicsView(self.scene, self)
+        self.view = _SvgGraphicsView(self.scene, self)
+        self.view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.view.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.view.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         self.view.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
@@ -149,7 +164,7 @@ class SvgViewer(QWidget):
                 self.zoom(0.85)
             event.accept()
         else:
-            super().wheelEvent(event)
+            event.ignore()
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)

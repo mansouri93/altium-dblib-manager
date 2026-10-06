@@ -293,6 +293,32 @@ class AccessDBManager:
             conn.commit()
             return cursor.rowcount > 0
 
+    @staticmethod
+    def validate_table_name(name: str) -> tuple[bool, str]:
+        """
+        Validate table name according to Microsoft Access standard and Altium DbLib compatibility:
+        - 1 to 64 characters long
+        - Cannot begin with leading spaces or be empty
+        - Cannot contain: . ! ` [ ] " | = or ASCII control characters
+        Returns (is_valid, error_message).
+        """
+        if not name or not name.strip():
+            return False, "Table name cannot be empty."
+        if len(name) > 64:
+            return False, f"Table name exceeds maximum length of 64 characters (current: {len(name)})."
+        if name != name.lstrip():
+            return False, "Table name cannot start with a space."
+
+        # Microsoft Access prohibited: . ! ` [ ] " and control characters (0-31)
+        # Altium DbLib INI / options safety: | =
+        prohibited_chars = {'.', '!', '`', '[', ']', '"', '|', '='}
+        found = [c for c in name if c in prohibited_chars or ord(c) < 32]
+        if found:
+            chars_str = " ".join(f"'{c}'" for c in sorted(set(found)) if ord(c) >= 32)
+            return False, f"Table name contains invalid character(s): {chars_str}. Characters . ! ` [ ] \" | = and control characters are not allowed."
+
+        return True, ""
+
     def create_category_table(self, table_name: str, custom_fields: list[dict[str, Any]] | None = None) -> bool:
         """
         Create a new category table.
@@ -460,6 +486,24 @@ class AccessDBManager:
                     "is_mandatory": is_man,
                 })
         return schema
+
+    def get_calculated_columns(self, table_name: str) -> set[str]:
+        """
+        Return the set of column names that are calculated (formula-based) in the given table.
+        Calculated fields cannot be modified directly via SQL UPDATE/INSERT.
+        """
+        if not table_name:
+            return set()
+        try:
+            schema = self.get_table_schema(table_name)
+            return {
+                f["name"]
+                for f in schema
+                if f.get("type") == "calculated" or bool(str(f.get("expression", "")).strip())
+            }
+        except Exception as exc:
+            logger.warning(f"Failed to get calculated columns for {table_name}: {exc}")
+            return set()
 
     def add_column(
         self,

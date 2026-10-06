@@ -29,6 +29,8 @@ from PySide6.QtWidgets import (
     QMenu,
     QButtonGroup,
     QDialog,
+    QScrollArea,
+    QFrame,
 )
 from ..config import (
     DB_PATH,
@@ -488,10 +490,25 @@ class MainWindow(QMainWindow):
         inspect_header_layout.addWidget(btn_close_inspect)
         inspect_layout.addLayout(inspect_header_layout)
 
+        # Scroll Area for Inspector Cards
+        self.inspect_scroll_area = QScrollArea(self.inspect_container)
+        self.inspect_scroll_area.setWidgetResizable(True)
+        self.inspect_scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        self.inspect_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.inspect_scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.inspect_scroll_area.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+
+        inspect_content = QWidget()
+        inspect_content.setStyleSheet("background: transparent;")
+        inspect_content_layout = QVBoxLayout(inspect_content)
+        inspect_content_layout.setContentsMargins(0, 0, 4, 0)
+        inspect_content_layout.setSpacing(8)
+
         # 1. Symbol Preview Card
         sym_box = QGroupBox("Schematic Symbol Preview", self)
         sym_box_layout = QVBoxLayout(sym_box)
         self.symbol_viewer = SvgViewer("Symbol", self)
+        self.symbol_viewer.setMinimumHeight(280)
         sym_box_layout.addWidget(self.symbol_viewer)
 
         sym_info_layout = QHBoxLayout()
@@ -506,7 +523,7 @@ class MainWindow(QMainWindow):
         sym_btn.clicked.connect(self._on_browse_symbol)
         sym_info_layout.addWidget(sym_btn)
         sym_box_layout.addLayout(sym_info_layout)
-        inspect_layout.addWidget(sym_box, 1)
+        inspect_content_layout.addWidget(sym_box, 1)
 
         # 2. Footprint Preview Card (Supports up to 3 Footprints)
         fp_box = QGroupBox("PCB Footprint Preview", self)
@@ -582,7 +599,7 @@ class MainWindow(QMainWindow):
         fp_info_layout.addWidget(self.fp_clear_btn)
 
         fp_box_layout.addLayout(fp_info_layout)
-        inspect_layout.addWidget(fp_box, 2)
+        inspect_content_layout.addWidget(fp_box, 1)
 
         # 3. InvenTree Live Card
         it_box = QGroupBox("InvenTree Inventory Status", self)
@@ -614,7 +631,9 @@ class MainWindow(QMainWindow):
 
         it_box_layout.addLayout(it_actions)
 
-        inspect_layout.addWidget(it_box)
+        inspect_content_layout.addWidget(it_box, 0)
+        self.inspect_scroll_area.setWidget(inspect_content)
+        inspect_layout.addWidget(self.inspect_scroll_area, 1)
         self.main_splitter.addWidget(self.inspect_container)
 
         # Set initial splitter layout sizes
@@ -768,8 +787,9 @@ class MainWindow(QMainWindow):
             return
 
         new_name = new_name.strip()
-        if not re.match(r"^[A-Za-z0-9_ ]+$", new_name):
-            QMessageBox.warning(self, "Invalid Name", "Table name can only contain letters, numbers, spaces, and underscores.")
+        is_valid, err_msg = self.db_manager.validate_table_name(new_name)
+        if not is_valid:
+            QMessageBox.warning(self, "Invalid Table Name", err_msg)
             return
 
         try:
@@ -1035,11 +1055,13 @@ class MainWindow(QMainWindow):
             count = self.table_model.rowCount()
             self.lbl_record_count.setText(f"{count} component{'s' if count != 1 else ''}")
 
-            # Find and select the new row, and activate editor on Package or Value
+            # Find and select the new row, and activate editor on Part Number (if text) or Package/Value
             for r in range(self.table_model.rowCount()):
                 if self.table_model.records[r].get("ID") == new_id:
                     col_idx = 1
-                    if "Package" in self.table_model.columns:
+                    if "Part Number" in self.table_model.columns and "Part Number" not in self.table_model.calculated_columns:
+                        col_idx = self.table_model.columns.index("Part Number")
+                    elif "Package" in self.table_model.columns:
                         col_idx = self.table_model.columns.index("Package")
                     elif "Value" in self.table_model.columns:
                         col_idx = self.table_model.columns.index("Value")

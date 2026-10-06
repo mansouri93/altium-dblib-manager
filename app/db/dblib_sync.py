@@ -88,19 +88,21 @@ class DbLibSync:
             ("Power", 1),
             ("Manufacturer", 1),
             ("Manufacturer Part Number", 1),
+            ("IPN", 1),
         ]
 
         curr_field_idx = highest_field_idx
         for field_name, ftype in standard_fields:
             if field_name in columns or not columns:
                 curr_field_idx += 1
+                param_name = field_name if ftype == 0 else f"[{field_name}]"
                 new_lines.append(f"[FieldMap{curr_field_idx}]")
                 opt = (
                     f"Options=FieldName={table_name}.{field_name}|"
                     f"TableNameOnly={table_name}|"
                     f"FieldNameOnly={field_name}|"
                     f"FieldType={ftype}|"
-                    f"ParameterName=[{field_name}]|"
+                    f"ParameterName={param_name}|"
                     f"VisibleOnAdd=False|AddMode=0|RemoveMode=0|UpdateMode=0"
                 )
                 new_lines.append(opt)
@@ -125,31 +127,59 @@ class DbLibSync:
         return True
 
     def remove_table_from_dblib(self, table_name: str) -> bool:
-        """Remove a table and its field maps from .DbLib file."""
+        """Remove a table and its field maps from .DbLib file, cleanly renumbering sections."""
         if not self.dblib_path.exists():
             return False
 
         content = self.dblib_path.read_text(encoding="utf-8", errors="ignore")
-        lines = content.splitlines()
+        
+        # Parse into sections: list of (header_line, [body_lines])
+        sections: list[tuple[str, list[str]]] = []
+        cur_header = ""
+        cur_body: list[str] = []
 
-        cleaned_lines = []
-        skip_block = False
-
-        for line in lines:
+        for line in content.splitlines():
             stripped = line.strip()
             if stripped.startswith("[") and stripped.endswith("]"):
-                skip_block = False
+                if cur_header or cur_body:
+                    sections.append((cur_header, cur_body))
+                cur_header = stripped
+                cur_body = []
+            else:
+                cur_body.append(line)
+        if cur_header or cur_body:
+            sections.append((cur_header, cur_body))
 
-            if stripped == f"TableName={table_name}" or f"TableNameOnly={table_name}" in stripped:
-                # If this block is for the table being removed, skip recent section header too
-                if cleaned_lines and cleaned_lines[-1].strip().startswith("["):
-                    cleaned_lines.pop()
-                skip_block = True
-                continue
+        # Filter out sections belonging to table_name or empty orphan tables
+        kept_sections: list[tuple[str, list[str]]] = []
+        for header, body in sections:
+            body_text = "\n".join(body)
+            is_target_table = (
+                f"TableName={table_name}" in body_text
+                or f"TableNameOnly={table_name}|" in body_text
+                or f"FieldName={table_name}." in body_text
+            )
+            is_empty_table = header.startswith("[Table") and not any(l.strip().startswith("TableName=") for l in body)
+            if not is_target_table and not is_empty_table:
+                kept_sections.append((header, body))
 
-            if not skip_block:
-                cleaned_lines.append(line)
+        # Re-index [TableN] and [FieldMapN] consecutively
+        table_counter = 0
+        field_counter = 0
+        output_lines: list[str] = []
 
-        self.dblib_path.write_text("\n".join(cleaned_lines) + "\n", encoding="utf-8")
+        for header, body in kept_sections:
+            if header.startswith("[Table"):
+                table_counter += 1
+                header = f"[Table{table_counter}]"
+            elif header.startswith("[FieldMap"):
+                field_counter += 1
+                header = f"[FieldMap{field_counter}]"
+
+            if header:
+                output_lines.append(header)
+            output_lines.extend(body)
+
+        self.dblib_path.write_text("\n".join(output_lines) + "\n", encoding="utf-8")
         return True
 

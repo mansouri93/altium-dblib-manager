@@ -279,9 +279,11 @@ class TableCreateDialog(QDialog):
             self.txt_table_name.setFocus()
             return
 
-        # Check valid characters
-        if not re.match(r"^[A-Za-z0-9_ ]+$", tname):
-            QMessageBox.warning(self, "Invalid Characters", "Table name can only contain letters, numbers, spaces, and underscores.")
+        # Validate table name according to MS Access standard
+        is_valid, err_msg = self.db_manager.validate_table_name(tname)
+        if not is_valid:
+            QMessageBox.warning(self, "Invalid Table Name", err_msg)
+            self.txt_table_name.setFocus()
             return
 
         if tname.lower() in self.existing_tables:
@@ -299,7 +301,7 @@ class TableCreateDialog(QDialog):
             self.db_manager.create_category_table(tname, self.fields)
 
             # 2. Sync into Altium .DbLib
-            col_names = [f["name"] for f in self.fields]
+            col_names = self.db_manager.get_columns(tname)
             self.dblib_sync.sync_table_to_dblib(tname, col_names)
 
             self.table_created.emit(tname)

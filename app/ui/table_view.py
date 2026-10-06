@@ -49,6 +49,7 @@ class ComponentsTableModel(QAbstractTableModel):
         self.current_table: str = ""
         self.columns: list[str] = []
         self.records: list[dict[str, Any]] = []
+        self.calculated_columns: set[str] = set()
         self.spacer_count: int = 0
         self.separator_title: str = ""
 
@@ -69,9 +70,11 @@ class ComponentsTableModel(QAbstractTableModel):
         if table_name:
             self.columns = self.db_manager.get_columns(table_name)
             self.records = self.db_manager.fetch_records(table_name)
+            self.calculated_columns = self.db_manager.get_calculated_columns(table_name)
         else:
             self.columns = []
             self.records = []
+            self.calculated_columns = set()
         self.endResetModel()
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
@@ -154,6 +157,10 @@ class ComponentsTableModel(QAbstractTableModel):
         elif role == Qt.ItemDataRole.ToolTipRole:
             if col_name in SYMBOL_FOOTPRINT_COLUMNS:
                 return f"{col_name} (System-managed reference - Read-only)"
+            if col_name in self.calculated_columns:
+                return f"{col_name} (Calculated formula - Read-only)"
+            if col_name == "ID":
+                return "ID (AutoNumber - Read-only)"
 
         return None
 
@@ -177,8 +184,8 @@ class ComponentsTableModel(QAbstractTableModel):
         col_name = self.columns[index.column()]
         default_flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
 
-        # ID, Part Number, and Symbol/Footprint columns are read-only
-        if col_name in ("ID", "Part Number") or col_name in SYMBOL_FOOTPRINT_COLUMNS:
+        # ID, Symbol/Footprint columns, and calculated formula columns are read-only
+        if col_name == "ID" or col_name in SYMBOL_FOOTPRINT_COLUMNS or col_name in self.calculated_columns:
             return default_flags
 
         return default_flags | Qt.ItemFlag.ItemIsEditable
@@ -191,7 +198,7 @@ class ComponentsTableModel(QAbstractTableModel):
             return False
 
         col_name = self.columns[index.column()]
-        if col_name in ("ID", "Part Number") or col_name in SYMBOL_FOOTPRINT_COLUMNS:
+        if col_name == "ID" or col_name in SYMBOL_FOOTPRINT_COLUMNS or col_name in self.calculated_columns:
             return False
 
         row_data = self.records[index.row()]
@@ -206,7 +213,7 @@ class ComponentsTableModel(QAbstractTableModel):
         try:
             ok = self.db_manager.update_cell(self.current_table, row_id, col_name, db_val)
             if ok:
-                if col_name in ("Package", "Value", "Tolerance"):
+                if self.calculated_columns or col_name in ("Package", "Value", "Tolerance"):
                     refreshed = self.db_manager.fetch_single_record(self.current_table, row_id)
                     if refreshed:
                         row_data.update(refreshed)
