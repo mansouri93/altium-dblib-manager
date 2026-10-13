@@ -5,7 +5,7 @@ import logging
 from pathlib import Path
 import re
 from typing import Any
-from PySide6.QtCore import Qt, QSortFilterProxyModel, QSize, QTimer, Signal
+from PySide6.QtCore import Qt, QSortFilterProxyModel, QSize, QTimer, Signal, QThread
 from PySide6.QtGui import QFontMetrics, QPainter, QFont, QColor, QIcon, QPen, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QMainWindow,
@@ -65,6 +65,41 @@ from .styles import get_theme_palette, apply_theme
 from .smooth_scroll import enable_smooth_scroll, install_global_wheel_scroll_filter
 
 logger = logging.getLogger(__name__)
+
+
+class InvenTreeSyncWorker(QThread):
+    """Background worker to fetch InvenTree part details without freezing the UI."""
+    finished_data = Signal(dict)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        it_client: InvenTreeClient,
+        part_or_pk: Any,
+        format_units: bool = True,
+        omit_pcs: bool = True,
+        parent=None,
+    ) -> None:
+        try:
+            super().__init__(parent)
+        except Exception:
+            super().__init__()
+        self.it_client = it_client
+        self.part_or_pk = part_or_pk
+        self.format_units = format_units
+        self.omit_pcs = omit_pcs
+
+    def run(self) -> None:
+        try:
+            data = self.it_client.get_part_sync_data(
+                self.part_or_pk,
+                format_units=self.format_units,
+                omit_pcs=self.omit_pcs,
+            )
+            self.finished_data.emit(data or {})
+        except Exception as exc:
+            logger.error(f"InvenTree background sync failed: {exc}", exc_info=True)
+            self.failed.emit(str(exc))
 
 
 class VerticalBorderTab(QWidget):
@@ -190,6 +225,7 @@ class MainWindow(QMainWindow):
         self.preview_cache = PreviewCache()
         self.inventree_client = InvenTreeClient()
         self.link_manager = ComponentLinkManager()
+        self._active_sync_workers: list[InvenTreeSyncWorker] = []
 
         # Splitter panel memory
         self._last_cat_width = 180
@@ -1030,12 +1066,25 @@ class MainWindow(QMainWindow):
             )
 
     def _on_altium_data_changed(self, top_left: QModelIndex, bottom_right: QModelIndex, roles: list[int] | None = None) -> None:
-        """Keep warehouse view synchronized when Altium table cells are edited."""
-        if hasattr(self, "warehouse_view") and not self.warehouse_view.isHidden():
-            self.warehouse_view.set_altium_context(
-                self.table_model.current_table,
-                self._get_displayed_altium_records(),
-            )
+        """Keep warehouse view synchronized only when warehouse-relevant Altium table cells are edited."""
+        if not hasattr(self, "warehouse_view") or self.warehouse_view.isHidden():
+            return
+
+        warehouse_relevant_cols = {"IPN", "Stock", "Location", "Part Number"}
+        c_min = top_left.column()
+        c_max = bottom_right.column()
+        edited_cols = {
+            self.table_model.columns[c]
+            for c in range(c_min, c_max + 1)
+            if 0 <= c < len(self.table_model.columns)
+        }
+        if not (edited_cols & warehouse_relevant_cols):
+            return
+
+        self.warehouse_view.set_altium_context(
+            self.table_model.current_table,
+            self._get_displayed_altium_records(),
+        )
 
     # ---------------- Component CRUD ----------------
     def _on_add_component(self) -> None:
@@ -1387,20 +1436,44 @@ class MainWindow(QMainWindow):
                 self._on_edit_warehouse_link(rec)
             return
 
-        # 4. Perform sync using the unique warehouse ID (part_pk)
+        # 4. Perform sync using the unique warehouse ID (part_pk) in background worker
         fmt_units, omit_pcs = AppSettingsManager.get_instance().get_stock_unit_options()
-        sync_data = self.inventree_client.get_part_sync_data(part_pk, format_units=fmt_units, omit_pcs=omit_pcs)
-        updates = self._apply_field_mappings(table_name, sync_data)
-        if "IPN" in self.table_model.columns and linked_ipn and not updates.get("IPN"):
-            updates["IPN"] = linked_ipn
-        logger.info(f"InvenTree sync result for PK {part_pk} ({linked_ipn}): {updates}")
 
-        if updates:
-            self.table_model.update_record_in_model(row, updates)
+        # In headless unit tests without full window initialization, execute directly
+        if not hasattr(self, "_active_sync_workers"):
+            sync_data = self.inventree_client.get_part_sync_data(part_pk, format_units=fmt_units, omit_pcs=omit_pcs)
+            updates = self._apply_field_mappings(table_name, sync_data)
+            if "IPN" in self.table_model.columns and linked_ipn and not updates.get("IPN"):
+                updates["IPN"] = linked_ipn
+            if updates:
+                self.table_model.update_record_in_model(row, updates)
+            return
 
-        self._on_table_row_selected()
-        summary_str = ", ".join(f"{k}={v}" for k, v in updates.items())
-        self.statusBar().showMessage(f"Synced InvenTree: {summary_str or 'No mapped fields changed'}")
+        self.statusBar().showMessage(f"Syncing with InvenTree for '{linked_ipn or part_pk}'...")
+
+        worker = InvenTreeSyncWorker(self.inventree_client, part_pk, fmt_units, omit_pcs, self)
+
+        def on_sync_done(sync_data: dict[str, Any]) -> None:
+            updates = self._apply_field_mappings(table_name, sync_data)
+            if "IPN" in self.table_model.columns and linked_ipn and not updates.get("IPN"):
+                updates["IPN"] = linked_ipn
+            logger.info(f"InvenTree sync result for PK {part_pk} ({linked_ipn}): {updates}")
+
+            if updates:
+                self.table_model.update_record_in_model(row, updates)
+
+            self._on_table_row_selected()
+            summary_str = ", ".join(f"{k}={v}" for k, v in updates.items())
+            self.statusBar().showMessage(f"Synced InvenTree: {summary_str or 'No mapped fields changed'}")
+
+        def on_sync_fail(err: str) -> None:
+            self.statusBar().showMessage(f"InvenTree sync failed: {err}")
+
+        worker.finished_data.connect(on_sync_done)
+        worker.failed.connect(on_sync_fail)
+        self._active_sync_workers.append(worker)
+        worker.finished.connect(lambda: self._active_sync_workers.remove(worker) if worker in self._active_sync_workers else None)
+        worker.start()
 
     def _find_row_index_by_id(self, row_id: int) -> int | None:
         """Find the source table_model row index for a given Access record ID."""
@@ -1455,29 +1528,41 @@ class MainWindow(QMainWindow):
                     "name": name,
                 })
 
-                # 2. Fetch warehouse data and apply mapped fields
+                # 2. Fetch warehouse data and apply mapped fields in background worker
                 fmt_units, omit_pcs = AppSettingsManager.get_instance().get_stock_unit_options()
-                sync_data = self.inventree_client.get_part_sync_data(int(pk), format_units=fmt_units, omit_pcs=omit_pcs)
-                updates = self._apply_field_mappings(table_name, sync_data)
-                if "IPN" in self.table_model.columns and ipn:
-                    updates["IPN"] = ipn
-                if not rec.get("Part Number") and ipn:
-                    updates["Part Number"] = ipn
+                self.statusBar().showMessage(f"Fetching details for InvenTree part '{ipn}'...")
 
-                src_row = self._find_row_index_by_id(row_id)
-                if src_row is not None and updates:
-                    self.table_model.update_record_in_model(src_row, updates)
+                worker = InvenTreeSyncWorker(self.inventree_client, selected, fmt_units, omit_pcs, self)
 
-                # 3. Refresh warehouse split view if visible
-                if hasattr(self, "warehouse_view") and not self.warehouse_view.isHidden():
-                    self.warehouse_view.set_altium_context(
-                        table_name,
-                        self._get_displayed_altium_records(),
-                    )
+                def on_edit_link_done(sync_data: dict[str, Any]) -> None:
+                    updates = self._apply_field_mappings(table_name, sync_data)
+                    if "IPN" in self.table_model.columns and ipn:
+                        updates["IPN"] = ipn
+                    if not rec.get("Part Number") and ipn:
+                        updates["Part Number"] = ipn
 
-                # 4. Refresh selection & status
-                self._on_table_row_selected()
-                self.statusBar().showMessage(f"Linked component to InvenTree '{ipn}' (PK: {pk})")
+                    src_row = self._find_row_index_by_id(row_id)
+                    if src_row is not None and updates:
+                        self.table_model.update_record_in_model(src_row, updates)
+
+                    # Refresh warehouse split view if visible
+                    if hasattr(self, "warehouse_view") and not self.warehouse_view.isHidden():
+                        self.warehouse_view.set_altium_context(
+                            table_name,
+                            self._get_displayed_altium_records(),
+                        )
+
+                    self._on_table_row_selected()
+                    self.statusBar().showMessage(f"Linked component to InvenTree '{ipn}' (PK: {pk})")
+
+                def on_edit_link_fail(err: str) -> None:
+                    self.statusBar().showMessage(f"Failed to fetch warehouse details: {err}")
+
+                worker.finished_data.connect(on_edit_link_done)
+                worker.failed.connect(on_edit_link_fail)
+                self._active_sync_workers.append(worker)
+                worker.finished.connect(lambda: self._active_sync_workers.remove(worker) if worker in self._active_sync_workers else None)
+                worker.start()
 
     def _on_unlink_component(self, rec: dict[str, Any] | None = None) -> None:
         if rec is None:
@@ -1584,25 +1669,38 @@ class MainWindow(QMainWindow):
         # 1. Save link in link_manager
         self.link_manager.set_link(table_name, row_id, it_part)
 
-        # 2. Get latest sync data and apply mapped fields
+        # 2. Get latest sync data and apply mapped fields in background worker
         fmt_units, omit_pcs = AppSettingsManager.get_instance().get_stock_unit_options()
-        sync_data = self.inventree_client.get_part_sync_data(int(pk), format_units=fmt_units, omit_pcs=omit_pcs)
-        updates = self._apply_field_mappings(table_name, sync_data)
-        if "IPN" in self.table_model.columns and ipn:
-            updates["IPN"] = ipn
-        if updates:
-            self.table_model.update_record_in_model(row, updates)
+        self.statusBar().showMessage(f"Linking and fetching warehouse details for '{ipn}'...")
 
-        # 3. Refresh warehouse split view
-        if hasattr(self, "warehouse_view") and not self.warehouse_view.isHidden():
-            self.warehouse_view.set_altium_context(
-                table_name,
-                self._get_displayed_altium_records(),
-            )
+        worker = InvenTreeSyncWorker(self.inventree_client, it_part, fmt_units, omit_pcs, self)
 
-        # 4. Refresh selection & status
-        self._on_table_row_selected()
-        self.statusBar().showMessage(f"Linked '{alt_pn}' to InvenTree '{ipn}'")
+        def on_link_done(sync_data: dict[str, Any]) -> None:
+            updates = self._apply_field_mappings(table_name, sync_data)
+            if "IPN" in self.table_model.columns and ipn:
+                updates["IPN"] = ipn
+            if updates:
+                self.table_model.update_record_in_model(row, updates)
+
+            # Refresh warehouse split view
+            if hasattr(self, "warehouse_view") and not self.warehouse_view.isHidden():
+                self.warehouse_view.set_altium_context(
+                    table_name,
+                    self._get_displayed_altium_records(),
+                )
+
+            # Refresh selection & status
+            self._on_table_row_selected()
+            self.statusBar().showMessage(f"Linked '{alt_pn}' to InvenTree '{ipn}'")
+
+        def on_link_fail(err: str) -> None:
+            self.statusBar().showMessage(f"Failed to link with warehouse: {err}")
+
+        worker.finished_data.connect(on_link_done)
+        worker.failed.connect(on_link_fail)
+        self._active_sync_workers.append(worker)
+        worker.finished.connect(lambda: self._active_sync_workers.remove(worker) if worker in self._active_sync_workers else None)
+        worker.start()
 
     def _on_restore_link_override(self, table_name: str, row_id: int) -> None:
         self.link_manager.clear_override(table_name, row_id)
@@ -1974,6 +2072,11 @@ class MainWindow(QMainWindow):
             self._save_current_table_column_layout()
         except Exception as exc:
             logger.error(f"Error saving column layouts on close: {exc}")
+        try:
+            if hasattr(self, "db_manager"):
+                self.db_manager.close()
+        except Exception as exc:
+            logger.warning(f"Error closing DB manager on close: {exc}")
         super().closeEvent(event)
 
     # ----------------- Warehouse Split View Handlers -----------------

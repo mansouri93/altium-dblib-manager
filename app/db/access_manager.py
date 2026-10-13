@@ -32,6 +32,50 @@ class AccessDBManager:
         self.db_path = Path(db_path)
         self.driver = "Microsoft Access Driver (*.mdb, *.accdb)"
         self.conn_str = f"DRIVER={{{self.driver}}};DBQ={self.db_path.resolve()};"
+        self._conn: pyodbc.Connection | None = None
+        self._columns_cache: dict[str, list[str]] = {}
+        self._schema_cache: dict[str, list[dict[str, Any]]] = {}
+
+    def _ensure_connection(self) -> pyodbc.Connection:
+        """Ensure active persistent connection to Access DB, reconnecting automatically if needed."""
+        if self._conn is not None:
+            try:
+                # Fast check if connection is active
+                cur = self._conn.cursor()
+                cur.execute("SELECT 1")
+                cur.fetchone()
+                return self._conn
+            except Exception:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+                self._conn = None
+
+        logger.info(f"Opening persistent Access DB connection to {self.db_path.name}...")
+        self._conn = pyodbc.connect(self.conn_str, autocommit=False)
+        return self._conn
+
+    def close(self) -> None:
+        """Cleanly close persistent connection and release file locks."""
+        if self._conn is not None:
+            try:
+                self._conn.close()
+                logger.info("Closed persistent Access DB connection.")
+            except Exception as exc:
+                logger.warning(f"Error closing Access DB connection: {exc}")
+            finally:
+                self._conn = None
+        self.invalidate_caches()
+
+    def invalidate_caches(self, table_name: str | None = None) -> None:
+        """Clear cached column lists and schema definitions."""
+        if table_name:
+            self._columns_cache.pop(table_name, None)
+            self._schema_cache.pop(table_name, None)
+        else:
+            self._columns_cache.clear()
+            self._schema_cache.clear()
 
     @staticmethod
     def create_new_database(db_path: str | Path) -> bool:
@@ -84,6 +128,8 @@ class AccessDBManager:
     @contextmanager
     def _get_dao_db(self):
         """Context manager to open Access database via DAO for schema manipulation."""
+        # Release pyodbc persistent connection to prevent file locking conflicts with DAO
+        self.close()
         import win32com.client
         import gc
         engine = win32com.client.Dispatch("DAO.DBEngine.120")
@@ -95,10 +141,13 @@ class AccessDBManager:
             del db
             del engine
             gc.collect()
+            self.invalidate_caches()
 
     def set_db_path(self, new_path: str | Path) -> None:
+        self.close()
         self.db_path = Path(new_path)
         self.conn_str = f"DRIVER={{{self.driver}}};DBQ={self.db_path.resolve()};"
+        self.invalidate_caches()
 
     def test_connection(self) -> tuple[bool, str]:
         """Test if the database file can be connected to."""
@@ -114,11 +163,16 @@ class AccessDBManager:
 
     @contextmanager
     def get_connection(self) -> Generator[pyodbc.Connection, None, None]:
-        conn = pyodbc.connect(self.conn_str, autocommit=False)
+        """Yield persistent connection, handling rollback on error without closing the connection."""
+        conn = self._ensure_connection()
         try:
             yield conn
-        finally:
-            conn.close()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
 
     def _coerce_value(self, column_name: str, value: Any) -> Any:
         """Coerce value to correct DB data type."""
@@ -144,18 +198,28 @@ class AccessDBManager:
                     tables.append(tname)
             return sorted(tables)
 
-    def get_columns(self, table_name: str) -> list[str]:
+    def get_columns(self, table_name: str, use_cache: bool = True) -> list[str]:
         """Return column names for a given table in order of ordinal position in MS Access."""
+        if not table_name:
+            return []
+        if use_cache and table_name in self._columns_cache:
+            return list(self._columns_cache[table_name])
+
         with self.get_connection() as conn:
             cursor = conn.cursor()
+            cols = []
             try:
-                cols = sorted(cursor.columns(table=table_name), key=lambda r: r.ordinal_position)
-                if cols:
-                    return [c.column_name for c in cols]
+                col_rows = sorted(cursor.columns(table=table_name), key=lambda r: r.ordinal_position)
+                if col_rows:
+                    cols = [c.column_name for c in col_rows]
             except Exception:
                 pass
-            cursor.execute(f"SELECT TOP 1 * FROM [{table_name}]")
-            return [col[0] for col in cursor.description]
+            if not cols:
+                cursor.execute(f"SELECT TOP 1 * FROM [{table_name}]")
+                cols = [col[0] for col in cursor.description]
+
+            self._columns_cache[table_name] = cols
+            return list(cols)
 
     def ensure_symbol_footprint_columns(self, table_name: str) -> list[str]:
         """
@@ -176,6 +240,7 @@ class AccessDBManager:
                         logger.error(f"Failed to add column [{col}] to table [{table_name}]: {exc}")
             if added:
                 conn.commit()
+                self.invalidate_caches(table_name)
                 logger.info(f"Auto-created missing symbol/footprint columns in [{table_name}]: {added}")
         return added
 
@@ -416,7 +481,7 @@ class AccessDBManager:
             logger.info(f"Created category table [{table_name}] with {len(tbl.Fields)} fields via DAO.")
             return True
 
-    def get_table_schema(self, table_name: str) -> list[dict[str, Any]]:
+    def get_table_schema(self, table_name: str, use_cache: bool = True) -> list[dict[str, Any]]:
         """
         Return rich field information for given table:
         [{
@@ -427,6 +492,11 @@ class AccessDBManager:
             "is_mandatory": bool
         }, ...]
         """
+        if not table_name:
+            return []
+        if use_cache and table_name in self._schema_cache:
+            return [dict(f) for f in self._schema_cache[table_name]]
+
         schema = []
         try:
             with self._get_dao_db() as db:
@@ -471,6 +541,7 @@ class AccessDBManager:
                         "is_primary_key": is_pk,
                         "is_mandatory": is_mandatory,
                     })
+            self._schema_cache[table_name] = schema
         except Exception as exc:
             logger.error(f"Error getting DAO schema for {table_name}: {exc}", exc_info=True)
             cols = self.get_columns(table_name)
@@ -531,6 +602,7 @@ class AccessDBManager:
             cursor = conn.cursor()
             cursor.execute(f"ALTER TABLE [{table_name}] ADD COLUMN [{col_name}] {sql_type}")
             conn.commit()
+            self.invalidate_caches(table_name)
         logger.info(f"Added column [{col_name}] ({sql_type}) to [{table_name}]")
         return True
 
@@ -546,6 +618,7 @@ class AccessDBManager:
             cursor = conn.cursor()
             cursor.execute(f"ALTER TABLE [{table_name}] DROP COLUMN [{col_name}]")
             conn.commit()
+            self.invalidate_caches(table_name)
         logger.info(f"Deleted column [{col_name}] from [{table_name}]")
         return True
 
@@ -671,6 +744,7 @@ class AccessDBManager:
             cursor = conn.cursor()
             cursor.execute(f"DROP TABLE [{table_name}]")
             conn.commit()
+            self.invalidate_caches(table_name)
         logger.info(f"Dropped table [{table_name}]")
         return True
 

@@ -146,14 +146,14 @@ class InvenTreeClient:
             logger.error(f"Error finding part by IPN {ipn}: {exc}")
             return None
 
-    def get_stock_and_location(self, part_pk: int) -> tuple[float, str]:
+    def get_stock_and_location(self, part_pk: int, part_dict: dict[str, Any] | None = None) -> tuple[float, str]:
         """
         Return (total_stock, location_string) for a part.
         Checks default_location first, then individual stock items if needed.
         """
         try:
             token = self._get_token()
-            part = api_get(self.conn, f"/api/part/{part_pk}/", token=token)
+            part = part_dict if isinstance(part_dict, dict) else api_get(self.conn, f"/api/part/{part_pk}/", token=token)
             if not isinstance(part, dict):
                 return 0.0, ""
 
@@ -261,7 +261,7 @@ class InvenTreeClient:
             token = self._get_token()
             res = api_get(self.conn, f"/api/part/{part_pk}/", token=token)
             if isinstance(res, dict) and "pk" in res:
-                stock, loc = self.get_stock_and_location(part_pk)
+                stock, loc = self.get_stock_and_location(part_pk, part_dict=res)
                 res["location_name"] = loc
                 res["total_in_stock"] = stock
                 return res
@@ -324,11 +324,15 @@ class InvenTreeClient:
         if not part and pk:
             return {}
 
-        stock, loc = self.get_stock_and_location(pk)
-        units = part.get("units") or ""
-        part["total_in_stock"] = stock
-        part["location_name"] = loc
+        if "total_in_stock" in part and "location_name" in part:
+            stock = float(part.get("total_in_stock") or 0.0)
+            loc = str(part.get("location_name") or "")
+        else:
+            stock, loc = self.get_stock_and_location(pk, part_dict=part)
+            part["total_in_stock"] = stock
+            part["location_name"] = loc
 
+        units = part.get("units") or ""
         formatted_stock = format_stock_value(stock, units if format_units else None, omit_pcs=omit_pcs)
         part["formatted_stock"] = formatted_stock
 
