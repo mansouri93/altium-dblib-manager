@@ -38,6 +38,15 @@ TableName=Resistor
 Enabled=True
 UserWhere=0
 UserWhereText=
+[Table4]
+SchemaName=
+TableName=Switch
+Enabled=True
+UserWhere=0
+UserWhereText=
+BrowserOrder_Sorting=
+BrowserOrder_Grouping=
+BrowserOrder_Visible=Part Number0=87|Location0=67|Stock0=51|Package0=65|IPN0=40|ID0=34|Library Ref0=77|Library Path0=395|Footprint Ref0=100|Footprint Path0=466|Footprint Ref 20=101|Footprint Path 20=107|Footprint Ref 30=101|Footprint Path 30=107
 [FieldMap1]
 Options=FieldName=Capacitor.Part Number|TableNameOnly=Capacitor|FieldNameOnly=Part Number|FieldType=0|ParameterName=Part Number|VisibleOnAdd=False|AddMode=0|RemoveMode=0|UpdateMode=0
 [FieldMap2]
@@ -102,3 +111,45 @@ Options=FieldName=Resistor.Footprint Path 2|TableNameOnly=Resistor|FieldNameOnly
 Options=FieldName=Resistor.Footprint Ref 3|TableNameOnly=Resistor|FieldNameOnly=Footprint Ref 3|FieldType=1|ParameterName=[Footprint Ref 3]|VisibleOnAdd=False|AddMode=0|RemoveMode=0|UpdateMode=0
 [FieldMap32]
 Options=FieldName=Resistor.Footprint Path 3|TableNameOnly=Resistor|FieldNameOnly=Footprint Path 3|FieldType=1|ParameterName=[Footprint Path 3]|VisibleOnAdd=False|AddMode=0|RemoveMode=0|UpdateMode=0
+[FieldMap33]
+Options=FieldName=Switch.Part Number|TableNameOnly=Switch|FieldNameOnly=Part Number|FieldType=0|ParameterName=Part Number|VisibleOnAdd=False|AddMode=0|RemoveMode=0|UpdateMode=0
+[FieldMap34]
+Options=FieldName=Switch.Location|TableNameOnly=Switch|FieldNameOnly=Location|FieldType=1|ParameterName=[Location]|VisibleOnAdd=False|AddMode=0|RemoveMode=0|UpdateMode=0
+[FieldMap35]
+Options=FieldName=Switch.Stock|TableNameOnly=Switch|FieldNameOnly=Stock|FieldType=1|ParameterName=[Stock]|VisibleOnAdd=False|AddMode=0|RemoveMode=0|UpdateMode=0
+[FieldMap36]
+Options=FieldName=Switch.Package|TableNameOnly=Switch|FieldNameOnly=Package|FieldType=1|ParameterName=[Package]|VisibleOnAdd=False|AddMode=0|RemoveMode=0|UpdateMode=0
+[FieldMap37]
+Options=FieldName=Switch.IPN|TableNameOnly=Switch|FieldNameOnly=IPN|FieldType=1|ParameterName=[IPN]|VisibleOnAdd=False|AddMode=0|RemoveMode=0|UpdateMode=0
+[FieldMap38]
+Options=FieldName=Switch.Library Ref|TableNameOnly=Switch|FieldNameOnly=Library Ref|FieldType=1|ParameterName=[Library Ref]|VisibleOnAdd=False|AddMode=0|RemoveMode=0|UpdateMode=0
+[FieldMap39]
+Options=FieldName=Switch.Library Path|TableNameOnly=Switch|FieldNameOnly=Library Path|FieldType=1|ParameterName=[Library Path]|VisibleOnAdd=False|AddMode=0|RemoveMode=0|UpdateMode=0
+[FieldMap40]
+Options=FieldName=Switch.Footprint Ref|TableNameOnly=Switch|FieldNameOnly=Footprint Ref|FieldType=1|ParameterName=[Footprint Ref]|VisibleOnAdd=False|AddMode=0|RemoveMode=0|UpdateMode=0
+[FieldMap41]
+Options=FieldName=Switch.Footprint Path|TableNameOnly=Switch|FieldNameOnly=Footprint Path|FieldType=1|ParameterName=[Footprint Path]|VisibleOnAdd=False|AddMode=0|RemoveMode=0|UpdateMode=0
+[FieldMap42]
+Options=FieldName=Switch.Footprint Ref 2|TableNameOnly=Switch|FieldNameOnly=Footprint Ref 2|FieldType=1|ParameterName=[Footprint Ref 2]|VisibleOnAdd=False|AddMode=0|RemoveMode=0|UpdateMode=0
+[FieldMap43]
+Options=FieldName=Switch.Footprint Path 2|TableNameOnly=Switch|FieldNameOnly=Footprint Path 2|FieldType=1|ParameterName=[Footprint Path 2]|VisibleOnAdd=False|AddMode=0|RemoveMode=0|UpdateMode=0
+[FieldMap44]
+Options=FieldName=Switch.Footprint Ref 3|TableNameOnly=Switch|FieldNameOnly=Footprint Ref 3|FieldType=1|ParameterName=[Footprint Ref 3]|VisibleOnAdd=False|AddMode=0|RemoveMode=0|UpdateMode=0
+[FieldMap45]
+Options=FieldName=Switch.Footprint Path 3|TableNameOnly=Switch|FieldNameOnly=Footprint Path 3|FieldType=1|ParameterName=[Footprint Path 3]|VisibleOnAdd=False|AddMode=0|RemoveMode=0|UpdateMode=0
+[Table5]
+SchemaName=
+TableName=IC-MCU
+Enabled=True
+UserWhere=0
+UserWhereText=
+[FieldMap46]
+Options=FieldName=IC-MCU.Part Number|TableNameOnly=IC-MCU|FieldNameOnly=Part Number|FieldType=0|ParameterName=Part Number|VisibleOnAdd=False|AddMode=0|RemoveMode=0|UpdateMode=0
+[FieldMap47]
+Options=FieldName=IC-MCU.Location|TableNameOnly=IC-MCU|FieldNameOnly=Location|FieldType=1|ParameterName=[Location]|VisibleOnAdd=False|AddMode=0|RemoveMode=0|UpdateMode=0
+[FieldMap48]
+Options=FieldName=IC-MCU.Stock|TableNameOnly=IC-MCU|FieldNameOnly=Stock|FieldType=1|ParameterName=[Stock]|VisibleOnAdd=False|AddMode=0|RemoveMode=0|UpdateMode=0
+[FieldMap49]
+Options=FieldName=IC-MCU.Package|TableNameOnly=IC-MCU|FieldNameOnly=Package|FieldType=1|ParameterName=[Package]|VisibleOnAdd=False|AddMode=0|RemoveMode=0|UpdateMode=0
+[FieldMap50]
+Options=FieldName=IC-MCU.IPN|TableNameOnly=IC-MCU|FieldNameOnly=IPN|FieldType=1|ParameterName=[IPN]|VisibleOnAdd=False|AddMode=0|RemoveMode=0|UpdateMode=0
