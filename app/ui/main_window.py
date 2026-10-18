@@ -47,13 +47,13 @@ from ..db.access_manager import AccessDBManager, check_access_driver_installed
 from ..db.dblib_sync import DbLibSync
 from ..altium.preview_cache import PreviewCache
 from ..altium.unit_engine import EngineeringValueParser, ColumnUnitConfigManager
-from ..inventree.client import InvenTreeClient, ComponentLinkManager
+from ..inventree.client import InvenTreeClient, ComponentLinkManager, TableCategoryManager
 from .table_view import ComponentsTableModel, TableItemDelegate, AltiumFilterProxyModel
 from .svg_viewer import SvgViewer
 from .footprint_preview_widget import FootprintPreviewWidget
 from .library_browser import LibraryBrowserDialog
 from .inventree_dialog import InvenTreeSearchDialog
-from .warehouse_view import WarehouseLinkWidget
+from .warehouse_view import WarehouseLinkWidget, CategoryFilterDialog
 from .unit_config_dialog import ColumnUnitConfigDialog
 from .inventree_settings_dialog import InvenTreeSettingsDialog
 from .settings_dialog import SettingsDialog
@@ -225,6 +225,8 @@ class MainWindow(QMainWindow):
         self.preview_cache = PreviewCache()
         self.inventree_client = InvenTreeClient()
         self.link_manager = ComponentLinkManager()
+        self.table_category_manager = TableCategoryManager()
+        self._all_warehouse_categories_cache: list[dict[str, Any]] = []
         self._active_sync_workers: list[InvenTreeSyncWorker] = []
 
         # Splitter panel memory
@@ -469,12 +471,18 @@ class MainWindow(QMainWindow):
         self.center_splitter = QSplitter(Qt.Orientation.Horizontal, self)
         self.center_splitter.addWidget(table_container)
 
-        self.warehouse_view = WarehouseLinkWidget(self.inventree_client, self.link_manager, self)
+        self.warehouse_view = WarehouseLinkWidget(
+            self.inventree_client,
+            self.link_manager,
+            self.table_category_manager,
+            self,
+        )
         self.warehouse_view.setVisible(False)
         self.warehouse_view.create_component_requested.connect(self._on_create_component_from_warehouse)
         self.warehouse_view.edit_link_requested.connect(self._on_edit_warehouse_link)
         self.warehouse_view.unlink_component_requested.connect(self._on_unlink_component)
         self.warehouse_view.link_warehouse_to_altium_requested.connect(self._on_link_warehouse_part_to_selected_altium)
+        self.warehouse_view.relink_other_part_requested.connect(self._on_relink_warehouse_part_to_selected_altium)
         self.warehouse_view.part_inspected.connect(self._on_warehouse_part_inspected)
         self.warehouse_view.altium_row_focus_requested.connect(self._on_focus_altium_row)
         self.warehouse_view.rows_rebuilt.connect(self._sync_table_spacers)
@@ -774,14 +782,17 @@ class MainWindow(QMainWindow):
 
         if item:
             table_name = item.text()
+            act_wh_cats = menu.addAction(AppIcons.inventory_box(), f"Configure Warehouse Categories for '{table_name}'...")
+            act_wh_cats.triggered.connect(lambda ch=False, tn=table_name: self._on_configure_table_warehouse_categories(tn))
+
             act_schema = menu.addAction(AppIcons.table(), f"Manage Columns / Schema for '{table_name}'...")
-            act_schema.triggered.connect(lambda: self._on_manage_table_schema(table_name))
+            act_schema.triggered.connect(lambda ch=False, tn=table_name: self._on_manage_table_schema(tn))
 
             act_rename = menu.addAction(AppIcons.edit(), f"Rename Category '{table_name}'...")
-            act_rename.triggered.connect(lambda: self._on_rename_category(table_name))
+            act_rename.triggered.connect(lambda ch=False, tn=table_name: self._on_rename_category(tn))
 
             act_delete = menu.addAction(AppIcons.delete(), f"Delete Category '{table_name}'")
-            act_delete.triggered.connect(lambda: self._on_delete_category(table_name))
+            act_delete.triggered.connect(lambda ch=False, tn=table_name: self._on_delete_category(tn))
 
             menu.addSeparator()
 
@@ -793,8 +804,40 @@ class MainWindow(QMainWindow):
 
         menu.exec(self.categories_list.mapToGlobal(pos))
 
+    def _on_configure_table_warehouse_categories(self, table_name: str) -> None:
+        if not table_name:
+            return
+        if not self._all_warehouse_categories_cache:
+            try:
+                self._all_warehouse_categories_cache = self.inventree_client.get_all_categories()
+            except Exception as exc:
+                logger.error(f"Failed to fetch warehouse categories: {exc}")
+                self._all_warehouse_categories_cache = []
+
+        current_ids = set(self.table_category_manager.get_table_categories(table_name))
+        dlg = CategoryFilterDialog(self._all_warehouse_categories_cache, current_ids, parent=self)
+        dlg.setWindowTitle(f"Configure Warehouse Categories — [{table_name}]")
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            selected_ids = dlg.get_selected_ids()
+            self.table_category_manager.set_table_categories(table_name, selected_ids)
+            self.statusBar().showMessage(f"Configured {len(selected_ids)} warehouse categories for '{table_name}'.")
+
+            # If split view is open and currently on this table, reload immediately
+            if hasattr(self, "warehouse_view") and not self.warehouse_view.isHidden():
+                if self.table_model.current_table == table_name:
+                    self.warehouse_view.set_altium_context(
+                        table_name,
+                        self._get_displayed_altium_records(),
+                        force_reload=True,
+                    )
+
     def _on_create_category_table(self) -> None:
-        dlg = TableCreateDialog(self.db_manager, self)
+        dlg = TableCreateDialog(
+            self.db_manager,
+            inventree_client=self.inventree_client,
+            category_manager=self.table_category_manager,
+            parent=self,
+        )
         dlg.table_created.connect(lambda _: self._load_categories())
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self._load_categories()
@@ -831,6 +874,7 @@ class MainWindow(QMainWindow):
         try:
             self.db_manager.rename_table(old_name, new_name)
             self.dblib_sync.rename_table_in_dblib(old_name, new_name)
+            self.table_category_manager.rename_table(old_name, new_name)
             self._load_categories()
             # Select the renamed item
             for i in range(self.categories_list.count()):
@@ -859,6 +903,7 @@ class MainWindow(QMainWindow):
         try:
             self.db_manager.drop_table(table_name)
             self.dblib_sync.remove_table_from_dblib(table_name)
+            self.table_category_manager.remove_table(table_name)
             self._load_categories()
             QMessageBox.information(self, "Category Deleted", f"Category table '{table_name}' was successfully deleted.")
         except Exception as exc:
@@ -1654,10 +1699,21 @@ class MainWindow(QMainWindow):
         if not pk or row_id is None:
             return
 
+        existing_link = self.link_manager.get_link(table_name, row_id) if row_id else None
+        if existing_link and not existing_link.get("unlinked") and existing_link.get("inventree_pk"):
+            old_pk = existing_link.get("inventree_pk")
+            old_ipn = existing_link.get("ipn") or existing_link.get("name") or f"PK #{old_pk}"
+            confirm_msg = (
+                f"Altium component '{alt_pn}' is currently linked to warehouse part '{old_ipn}'.\n\n"
+                f"Do you want to replace the existing link with InvenTree part '{ipn}' (PK: {pk})?"
+            )
+        else:
+            confirm_msg = f"Link Altium component '{alt_pn}' with InvenTree part '{ipn}' (PK: {pk})?"
+
         reply = QMessageBox.question(
             self,
             "Confirm Link",
-            f"Link Altium component '{alt_pn}' with InvenTree part '{ipn}' (PK: {pk})?",
+            confirm_msg,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.Yes,
         )
@@ -1687,6 +1743,7 @@ class MainWindow(QMainWindow):
                 self.warehouse_view.set_altium_context(
                     table_name,
                     self._get_displayed_altium_records(),
+                    force_reload=True,
                 )
 
             # Refresh selection & status
@@ -1698,6 +1755,85 @@ class MainWindow(QMainWindow):
 
         worker.finished_data.connect(on_link_done)
         worker.failed.connect(on_link_fail)
+        self._active_sync_workers.append(worker)
+        worker.finished.connect(lambda: self._active_sync_workers.remove(worker) if worker in self._active_sync_workers else None)
+        worker.start()
+
+    def _on_relink_warehouse_part_to_selected_altium(self, data: dict[str, Any]) -> None:
+        table_name = self.table_model.current_table
+        if not table_name:
+            QMessageBox.warning(self, "No Category Selected", "Please select a category table first.")
+            return
+
+        row = self._get_current_source_row()
+        if row is None:
+            QMessageBox.warning(
+                self,
+                "No Altium Component Selected",
+                "Please select an Altium component row in the left table to transfer the link to.",
+            )
+            return
+
+        rec = self.table_model.get_record(row)
+        if not rec:
+            return
+
+        it_part = data.get("inventree_part") or {}
+        old_table = data.get("old_table") or "another table"
+        old_row_id = data.get("old_row_id")
+
+        row_id = rec.get("ID")
+        alt_pn = rec.get("Part Number") or f"ID #{row_id}"
+        ipn = it_part.get("IPN") or it_part.get("name") or "Part"
+        pk = it_part.get("pk")
+        if not pk or row_id is None:
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Confirm Link Transfer",
+            f"Warehouse part '{ipn}' (PK: {pk}) is currently linked to '{old_table}' (Row #{old_row_id}).\n\n"
+            f"Transfer link to Altium component '{alt_pn}' in '{table_name}'?\n\n"
+            f"(The previous link in '{old_table}' will be automatically removed).",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        logger.info(f"Transferring link of InvenTree PK={pk} from [{old_table}:#{old_row_id}] to [{table_name}:#{row_id}]")
+
+        # 1. Save link in link_manager (this automatically unlinks from old_table due to single-link constraint)
+        self.link_manager.set_link(table_name, row_id, it_part)
+
+        # 2. Get latest sync data and apply mapped fields
+        fmt_units, omit_pcs = AppSettingsManager.get_instance().get_stock_unit_options()
+        self.statusBar().showMessage(f"Transferring link and syncing details for '{ipn}'...")
+
+        worker = InvenTreeSyncWorker(self.inventree_client, it_part, fmt_units, omit_pcs, self)
+
+        def on_relink_done(sync_data: dict[str, Any]) -> None:
+            updates = self._apply_field_mappings(table_name, sync_data)
+            if "IPN" in self.table_model.columns and ipn:
+                updates["IPN"] = ipn
+            if updates:
+                self.table_model.update_record_in_model(row, updates)
+
+            # Refresh warehouse split view
+            if hasattr(self, "warehouse_view") and not self.warehouse_view.isHidden():
+                self.warehouse_view.set_altium_context(
+                    table_name,
+                    self._get_displayed_altium_records(),
+                )
+
+            self._on_table_row_selected()
+            self.statusBar().showMessage(f"Transferred link of '{ipn}' to '{alt_pn}' in '{table_name}'.")
+
+        def on_relink_fail(err: str) -> None:
+            self.statusBar().showMessage(f"Failed to transfer link: {err}")
+
+        worker.finished_data.connect(on_relink_done)
+        worker.failed.connect(on_relink_fail)
         self._active_sync_workers.append(worker)
         worker.finished.connect(lambda: self._active_sync_workers.remove(worker) if worker in self._active_sync_workers else None)
         worker.start()
@@ -2113,6 +2249,7 @@ class MainWindow(QMainWindow):
             self.warehouse_view.set_altium_context(
                 self.table_model.current_table,
                 self._get_displayed_altium_records(),
+                force_reload=True,
             )
             self._sync_table_spacers()
             self.statusBar().showMessage("Warehouse split view enabled.")

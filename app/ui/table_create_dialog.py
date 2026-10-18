@@ -20,9 +20,11 @@ from PySide6.QtWidgets import (
 )
 from ..db.access_manager import AccessDBManager, SYMBOL_FOOTPRINT_COLUMNS
 from ..db.dblib_sync import DbLibSync
+from ..inventree.client import InvenTreeClient, TableCategoryManager
 from .icons import AppIcons
 from .smooth_scroll import enable_smooth_scroll
 from .table_schema_dialog import FieldEditDialog
+from .warehouse_view import CategoryFilterDialog
 
 logger = logging.getLogger(__name__)
 
@@ -35,18 +37,30 @@ class TableCreateDialog(QDialog):
     - Mandatory ID (AutoNumber) and Part Number (Short Text or Calculated).
     - Add, edit, remove fields prior to creation.
     - Path fields auto-configured as Long Text.
+    - Warehouse Categories selection from InvenTree.
     """
 
     table_created = Signal(str)  # table_name
 
-    def __init__(self, db_manager: AccessDBManager, parent=None) -> None:
+    def __init__(
+        self,
+        db_manager: AccessDBManager,
+        inventree_client: InvenTreeClient | None = None,
+        category_manager: TableCategoryManager | None = None,
+        parent=None,
+    ) -> None:
         super().__init__(parent)
         self.db_manager = db_manager
         self.dblib_sync = DbLibSync()
+        self.it_client = inventree_client or InvenTreeClient()
+        self.category_manager = category_manager or TableCategoryManager()
         self.existing_tables = [t.lower() for t in self.db_manager.list_tables()]
 
+        self.selected_category_ids: set[int] = set()
+        self.all_warehouse_categories: list[dict[str, Any]] = []
+
         self.setWindowTitle("Create New Category Table")
-        self.resize(760, 540)
+        self.resize(760, 580)
 
         self.fields: list[dict[str, Any]] = []
 
@@ -54,7 +68,7 @@ class TableCreateDialog(QDialog):
         layout.setContentsMargins(18, 18, 18, 18)
         layout.setSpacing(12)
 
-        # Table Name
+        # Table Configuration Group
         top_group = QGroupBox("Table Configuration", self)
         top_layout = QVBoxLayout(top_group)
         top_layout.setSpacing(10)
@@ -66,6 +80,15 @@ class TableCreateDialog(QDialog):
         self.txt_table_name.setPlaceholderText("e.g. Inductors, Connectors, Diodes...")
         row_name.addWidget(self.txt_table_name, stretch=1)
         top_layout.addLayout(row_name)
+
+        # Warehouse categories row
+        row_cat = QHBoxLayout()
+        row_cat.addWidget(QLabel("Warehouse Categories:"))
+        self.btn_select_wh_cats = QPushButton(" Select InvenTree Categories (0 selected)...")
+        self.btn_select_wh_cats.setIcon(AppIcons.inventory_box())
+        self.btn_select_wh_cats.clicked.connect(self._on_select_warehouse_categories)
+        row_cat.addWidget(self.btn_select_wh_cats, stretch=1)
+        top_layout.addLayout(row_cat)
 
         layout.addWidget(top_group)
 
@@ -272,6 +295,20 @@ class TableCreateDialog(QDialog):
         self.fields.pop(idx)
         self._render_table()
 
+    def _on_select_warehouse_categories(self) -> None:
+        if not self.all_warehouse_categories:
+            try:
+                self.all_warehouse_categories = self.it_client.get_all_categories()
+            except Exception as exc:
+                logger.error(f"Failed to fetch InvenTree categories: {exc}")
+                self.all_warehouse_categories = []
+
+        dlg = CategoryFilterDialog(self.all_warehouse_categories, self.selected_category_ids, parent=self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self.selected_category_ids = dlg.get_selected_ids()
+            cnt = len(self.selected_category_ids)
+            self.btn_select_wh_cats.setText(f" InvenTree Categories ({cnt} selected)")
+
     def _on_create_table(self) -> None:
         tname = self.txt_table_name.text().strip()
         if not tname:
@@ -303,6 +340,10 @@ class TableCreateDialog(QDialog):
             # 2. Sync into Altium .DbLib
             col_names = self.db_manager.get_columns(tname)
             self.dblib_sync.sync_table_to_dblib(tname, col_names)
+
+            # 3. Save warehouse category mapping if selected
+            if self.selected_category_ids:
+                self.category_manager.set_table_categories(tname, self.selected_category_ids)
 
             self.table_created.emit(tname)
             QMessageBox.information(self, "Table Created", f"Category table '{tname}' has been created and synced with Altium .DbLib successfully!")

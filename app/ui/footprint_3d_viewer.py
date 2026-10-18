@@ -153,11 +153,10 @@ class Footprint3DViewer(QWidget):
                     rep = g[0]
                     rnx, rny, rnz = rep.normal
                     dot_n = nx * rnx + ny * rny + nz * rnz
-                    # Check if normals are parallel and lie on the same plane
-                    if abs(dot_n) > 0.999:
+                    # Check if normals are parallel in the SAME direction and lie on the same plane
+                    if dot_n > 0.999:
                         rd = rnx * rep.points[0][0] + rny * rep.points[0][1] + rnz * rep.points[0][2]
-                        expected_d = rd if dot_n > 0 else -rd
-                        if abs(d - expected_d) < 0.005:  # within 5 microns
+                        if abs(d - rd) < 0.01:  # within 10 microns
                             g.append(poly)
                             placed = True
                             break
@@ -417,9 +416,14 @@ class Footprint3DViewer(QWidget):
                 p.drawText(QRectF(up - 15, vp - 10, 30, 20), Qt.AlignmentFlag.AlignCenter, pad.designator)
 
     def _draw_3d_mesh(self, p: QPainter) -> None:
-        """Render depth-sorted 3D polygons with directional Lambertian lighting."""
+        """Render depth-sorted 3D polygons with camera-space back-face culling and Lambertian lighting."""
         if not self.model:
             return
+
+        rad_yaw = math.radians(self.yaw)
+        rad_pitch = math.radians(self.pitch)
+        cyaw, syaw = math.cos(rad_yaw), math.sin(rad_yaw)
+        cpitch, spitch = math.cos(rad_pitch), math.sin(rad_pitch)
 
         # Light vector shining from front-top-right
         lx, ly, lz = 0.35, -0.55, 0.75
@@ -430,9 +434,21 @@ class Footprint3DViewer(QWidget):
 
         if self._planar_groups:
             # Render using coplanar surface grouping:
-            # For each coplanar group, calculate collective camera depth,
-            # and sort faces by area descending so base surfaces are drawn before surface details/text.
+            # For each coplanar group, test group normal against camera view direction (Back-Face Culling),
+            # calculate collective camera depth, and sort faces by area descending so base surfaces
+            # are drawn before surface details/text.
             for g in self._planar_groups:
+                rep = g[0]
+                rnx, rny, rnz = rep.normal
+                # Normal transform into camera coordinates
+                rnx1 = rnx * cyaw - rny * syaw
+                rny1 = rnx * syaw + rny * cyaw
+                rny2 = rny1 * cpitch - rnz * spitch
+
+                # Back-face culling: camera looks into +Y. If normal points along +Y (away from camera), cull.
+                if rny2 >= -1e-4:
+                    continue
+
                 g_items = []
                 all_y2 = []
                 for poly in g:
@@ -440,11 +456,11 @@ class Footprint3DViewer(QWidget):
                     for pt in proj_pts:
                         all_y2.append(pt[2])
 
-                    # Two-sided Lambertian lighting calculation
+                    # One-sided Lambertian lighting calculation
                     nx, ny, nz = poly.normal
                     dot = nx * lx + ny * ly + nz * lz
-                    intensity = abs(dot)
-                    factor = 0.42 + 0.58 * intensity  # Ambient 0.42, Diffuse 0.58
+                    intensity = max(0.0, dot)
+                    factor = 0.40 + 0.60 * intensity
 
                     r = int(min(255, poly.color[0] * factor))
                     g_col = int(min(255, poly.color[1] * factor))
@@ -463,13 +479,21 @@ class Footprint3DViewer(QWidget):
                     faces_to_render.append((sort_depth, proj_pts, color))
         else:
             for poly in self.model.polygons:
+                nx, ny, nz = poly.normal
+                nx1 = nx * cyaw - ny * syaw
+                ny1 = nx * syaw + ny * cyaw
+                ny2 = ny1 * cpitch - nz * spitch
+
+                # Back-face culling
+                if ny2 >= -1e-4:
+                    continue
+
                 proj_pts = [self._project(pt) for pt in poly.points]
                 avg_depth = sum(pt[2] for pt in proj_pts) / len(proj_pts)
 
-                nx, ny, nz = poly.normal
                 dot = nx * lx + ny * ly + nz * lz
-                intensity = abs(dot)
-                factor = 0.42 + 0.58 * intensity
+                intensity = max(0.0, dot)
+                factor = 0.40 + 0.60 * intensity
 
                 r = int(min(255, poly.color[0] * factor))
                 g_col = int(min(255, poly.color[1] * factor))

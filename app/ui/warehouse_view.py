@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QMenu,
 )
-from ..inventree.client import InvenTreeClient, ComponentLinkManager
+from ..inventree.client import InvenTreeClient, ComponentLinkManager, TableCategoryManager
 from .icons import AppIcons
 from .smooth_scroll import enable_smooth_scroll
 
@@ -154,10 +154,32 @@ class CategoryFilterDialog(QDialog):
             pid = c.get("parent")
             by_parent.setdefault(pid, []).append(c)
 
-        def build_node(parent_item: QTreeWidgetItem | None, parent_id: int | None) -> bool:
+        # Pre-compute descendant map to expand parent selections
+        descendant_map: dict[int, set[int]] = {}
+        def collect_descendants(cid: int) -> set[int]:
+            res: set[int] = set()
+            for ch in by_parent.get(cid, []):
+                cpk = ch.get("pk")
+                if cpk is not None:
+                    res.add(cpk)
+                    res |= collect_descendants(cpk)
+            return res
+
+        for c in self.all_categories:
+            cpk = c.get("pk")
+            if cpk is not None:
+                descendant_map[cpk] = collect_descendants(cpk)
+
+        # If a parent category was in selected_category_ids, expand to all its descendants
+        expanded = set(self.selected_category_ids)
+        for cid in list(self.selected_category_ids):
+            expanded |= descendant_map.get(cid, set())
+        self.selected_category_ids = expanded
+
+        def build_node(parent_item: QTreeWidgetItem | None, parent_id: int | None) -> list[QTreeWidgetItem]:
             children = by_parent.get(parent_id, [])
-            has_any_checked = False
-            for child in sorted(children, key=lambda x: x.get("name", "")):
+            items: list[QTreeWidgetItem] = []
+            for child in sorted(children, key=lambda x: str(x.get("name", ""))):
                 pk = child.get("pk")
                 name = child.get("name", "")
                 count = child.get("part_count", 0)
@@ -167,38 +189,110 @@ class CategoryFilterDialog(QDialog):
                 item.setTextAlignment(1, int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter))
                 item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
 
-                is_checked = pk in self.selected_category_ids
-                if is_checked:
-                    has_any_checked = True
-                item.setCheckState(0, Qt.CheckState.Checked if is_checked else Qt.CheckState.Unchecked)
-
                 if parent_item:
                     parent_item.addChild(item)
                 else:
                     self.tree.addTopLevelItem(item)
 
-                child_checked = build_node(item, pk)
-                if child_checked:
-                    has_any_checked = True
-                    item.setExpanded(True)
+                child_items = build_node(item, pk)
 
-            return has_any_checked
+                if child_items:
+                    all_checked = all(ch.checkState(0) == Qt.CheckState.Checked for ch in child_items)
+                    any_checked = any(ch.checkState(0) in (Qt.CheckState.Checked, Qt.CheckState.PartiallyChecked) for ch in child_items)
+                    if all_checked:
+                        item.setCheckState(0, Qt.CheckState.Checked)
+                        if pk is not None:
+                            self.selected_category_ids.add(pk)
+                        item.setExpanded(True)
+                    elif any_checked:
+                        item.setCheckState(0, Qt.CheckState.PartiallyChecked)
+                        if pk is not None:
+                            self.selected_category_ids.discard(pk)
+                        item.setExpanded(True)
+                    else:
+                        item.setCheckState(0, Qt.CheckState.Unchecked)
+                        if pk is not None:
+                            self.selected_category_ids.discard(pk)
+                else:
+                    is_checked = pk in self.selected_category_ids
+                    item.setCheckState(0, Qt.CheckState.Checked if is_checked else Qt.CheckState.Unchecked)
+
+                items.append(item)
+            return items
 
         build_node(None, None)
         self.tree.blockSignals(False)
 
+    def _set_descendants_check_state(self, item: QTreeWidgetItem, state: Qt.CheckState) -> None:
+        for i in range(item.childCount()):
+            child = item.child(i)
+            child_pk = child.data(0, Qt.ItemDataRole.UserRole)
+            child.setCheckState(0, state)
+            if child_pk is not None:
+                if state == Qt.CheckState.Checked:
+                    self.selected_category_ids.add(child_pk)
+                else:
+                    self.selected_category_ids.discard(child_pk)
+            self._set_descendants_check_state(child, state)
+
+    def _update_ancestors_check_state(self, item: QTreeWidgetItem) -> None:
+        parent = item.parent()
+        if not parent:
+            return
+
+        child_count = parent.childCount()
+        checked_count = 0
+        partial_count = 0
+
+        for i in range(child_count):
+            c_state = parent.child(i).checkState(0)
+            if c_state == Qt.CheckState.Checked:
+                checked_count += 1
+            elif c_state == Qt.CheckState.PartiallyChecked:
+                partial_count += 1
+
+        parent_pk = parent.data(0, Qt.ItemDataRole.UserRole)
+
+        if checked_count == child_count:
+            parent.setCheckState(0, Qt.CheckState.Checked)
+            if parent_pk is not None:
+                self.selected_category_ids.add(parent_pk)
+        elif checked_count > 0 or partial_count > 0:
+            parent.setCheckState(0, Qt.CheckState.PartiallyChecked)
+            if parent_pk is not None:
+                self.selected_category_ids.discard(parent_pk)
+        else:
+            parent.setCheckState(0, Qt.CheckState.Unchecked)
+            if parent_pk is not None:
+                self.selected_category_ids.discard(parent_pk)
+
+        self._update_ancestors_check_state(parent)
+
     def _on_item_changed(self, item: QTreeWidgetItem, column: int) -> None:
+        if column != 0:
+            return
+        self.tree.blockSignals(True)
+
         pk = item.data(0, Qt.ItemDataRole.UserRole)
-        if pk is not None:
-            if item.checkState(0) == Qt.CheckState.Checked:
+        state = item.checkState(0)
+
+        if state == Qt.CheckState.Checked:
+            if pk is not None:
                 self.selected_category_ids.add(pk)
-            else:
+            self._set_descendants_check_state(item, Qt.CheckState.Checked)
+        elif state == Qt.CheckState.Unchecked:
+            if pk is not None:
                 self.selected_category_ids.discard(pk)
+            self._set_descendants_check_state(item, Qt.CheckState.Unchecked)
+
+        self._update_ancestors_check_state(item)
+
+        self.tree.blockSignals(False)
         self._update_summary()
 
     def _select_all(self) -> None:
         self.tree.blockSignals(True)
-        def check_item(item: QTreeWidgetItem):
+        def check_item(item: QTreeWidgetItem) -> None:
             pk = item.data(0, Qt.ItemDataRole.UserRole)
             if pk:
                 self.selected_category_ids.add(pk)
@@ -214,7 +308,7 @@ class CategoryFilterDialog(QDialog):
     def _clear_all(self) -> None:
         self.selected_category_ids.clear()
         self.tree.blockSignals(True)
-        def uncheck_item(item: QTreeWidgetItem):
+        def uncheck_item(item: QTreeWidgetItem) -> None:
             item.setCheckState(0, Qt.CheckState.Unchecked)
             for i in range(item.childCount()):
                 uncheck_item(item.child(i))
@@ -312,6 +406,9 @@ class WarehouseTableModel(QAbstractTableModel):
                     return "🟠 Unlinked"
                 elif st == "UNMATCHED_ALTIUM":
                     return "⚪ Altium Only"
+                elif st == "LINKED_OTHER":
+                    oth_tbl = row.get("other_table") or "Other"
+                    return f"🔗 {oth_tbl}"
                 return ""
             elif col == 1:
                 return row.get("ipn") or "—"
@@ -343,6 +440,8 @@ class WarehouseTableModel(QAbstractTableModel):
                     return QBrush(QColor("#ffaa40"))
                 elif st == "UNMATCHED_ALTIUM":
                     return QBrush(QColor("#888899"))
+                elif st == "LINKED_OTHER":
+                    return QBrush(QColor("#d2a8ff"))
             elif col == 3:
                 val = row.get("stock")
                 if val is not None and val != "":
@@ -369,6 +468,8 @@ class WarehouseTableModel(QAbstractTableModel):
                 return QBrush(QColor("#1e2330"))
             elif row.get("status") == "UNMATCHED_ALTIUM":
                 return QBrush(QColor("#16161f"))
+            elif row.get("status") == "LINKED_OTHER":
+                return QBrush(QColor("#1c1829"))
 
         return None
 
@@ -384,6 +485,7 @@ class WarehouseLinkWidget(QWidget):
     edit_link_requested = Signal(dict, object)
     unlink_component_requested = Signal(dict)
     link_warehouse_to_altium_requested = Signal(dict)
+    relink_other_part_requested = Signal(dict)
     part_inspected = Signal(dict)
     altium_row_focus_requested = Signal(int)
     rows_rebuilt = Signal(int)
@@ -392,11 +494,13 @@ class WarehouseLinkWidget(QWidget):
         self,
         inventree_client: InvenTreeClient,
         link_manager: ComponentLinkManager | None = None,
+        category_manager: TableCategoryManager | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.it_client = inventree_client
         self.link_manager = link_manager or ComponentLinkManager()
+        self.category_manager = category_manager or TableCategoryManager()
 
         self.altium_records: list[dict[str, Any]] = []
         self.current_altium_table: str = ""
@@ -482,7 +586,7 @@ class WarehouseLinkWidget(QWidget):
         self.table_view.setColumnWidth(1, 130)  # InvenTree IPN
         self.table_view.setColumnWidth(3, 60)   # Stock
         self.table_view.setColumnWidth(4, 110)  # Location
-        self.table_view.setColumnWidth(5, 154)  # Action (+10% width: 140 -> 154)
+        self.table_view.setColumnWidth(5, 160)  # Action (holds Add & Link to buttons)
         self.table_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table_view.customContextMenuRequested.connect(self._show_context_menu)
 
@@ -492,43 +596,41 @@ class WarehouseLinkWidget(QWidget):
     # ----------------- Popup Category Filter Dialog -----------------
     def _open_category_filter_dialog(self) -> None:
         if not self.all_categories:
-            self.all_categories = self.it_client.get_all_categories()
+            try:
+                self.all_categories = self.it_client.get_all_categories()
+            except Exception as exc:
+                logger.error(f"Failed to fetch InvenTree categories: {exc}")
+                self.all_categories = []
 
         dialog = CategoryFilterDialog(self.all_categories, self.selected_category_ids, parent=self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.selected_category_ids = dialog.get_selected_ids()
             self._update_category_button_label()
+            if self.current_altium_table:
+                self.category_manager.set_table_categories(self.current_altium_table, self.selected_category_ids)
             self.reload_warehouse_inventory()
 
     def _update_category_button_label(self) -> None:
         count = len(self.selected_category_ids)
         self.btn_categories.setText(f" Categories ({count})")
 
-    def _auto_select_matching_category(self, table_name: str) -> None:
-        t_clean = table_name.lower().rstrip("s")
-        matched_ids = set()
-
-        for c in self.all_categories:
-            c_name = str(c.get("name") or "").lower().rstrip("s")
-            c_path = str(c.get("pathstring") or "").lower()
-            if t_clean == c_name or f"/{t_clean}" in c_path:
-                matched_ids.add(c.get("pk"))
-
-        if matched_ids:
-            self.selected_category_ids = matched_ids
-            self._update_category_button_label()
-            self.reload_warehouse_inventory()
-
     # ----------------- Inventory Data Fetching & Alignment -----------------
-    def set_altium_context(self, table_name: str, records: list[dict[str, Any]]) -> None:
-        table_changed = self.current_altium_table != table_name
+    def set_altium_context(self, table_name: str, records: list[dict[str, Any]], force_reload: bool = False) -> None:
+        table_changed = (self.current_altium_table != table_name) or force_reload
         self.current_altium_table = table_name
         self.altium_records = records
 
         if table_changed:
-            if not self.all_categories:
-                self.all_categories = self.it_client.get_all_categories()
-            self._auto_select_matching_category(table_name)
+            if not self.all_categories or force_reload:
+                try:
+                    self.all_categories = self.it_client.get_all_categories()
+                except Exception as exc:
+                    logger.error(f"Failed to fetch InvenTree categories: {exc}")
+                    self.all_categories = []
+            configured = self.category_manager.get_table_categories(table_name)
+            self.selected_category_ids = set(configured)
+            self._update_category_button_label()
+            self.reload_warehouse_inventory()
         else:
             self._build_table_rows()
 
@@ -583,6 +685,8 @@ class WarehouseLinkWidget(QWidget):
         matched_it_pks: set[int] = set()
         aligned_rows: list[dict[str, Any]] = []
 
+        all_linked_across = self.link_manager.get_all_linked_parts_across_tables()
+
         # Section 1: Aligned Altium Rows (Strict 1-to-1 index matching with Altium view)
         linked_count = 0
         unmatched_altium_count = 0
@@ -604,9 +708,14 @@ class WarehouseLinkWidget(QWidget):
                 # Strictly match by explicit warehouse IPN field if present; NEVER guess by Part Number
                 db_ipn = str(rec.get("IPN") or "").strip().lower()
                 if db_ipn and db_ipn in it_by_ipn:
-                    matched_it = it_by_ipn[db_ipn]
-                    if row_id:
-                        self.link_manager.set_link(self.current_altium_table, row_id, matched_it)
+                    candidate = it_by_ipn[db_ipn]
+                    cand_pk = candidate.get("pk")
+                    # Enforce single link constraint: do not auto-match if linked to another table
+                    linked_info = all_linked_across.get(cand_pk)
+                    if not linked_info or linked_info[0] == self.current_altium_table:
+                        matched_it = candidate
+                        if row_id:
+                            self.link_manager.set_link(self.current_altium_table, row_id, matched_it)
 
             if matched_it:
                 matched_it_pks.add(matched_it["pk"])
@@ -638,16 +747,38 @@ class WarehouseLinkWidget(QWidget):
 
             aligned_rows.append(row_data)
 
-        # Section 2: Unlinked Warehouse Parts
-        unlinked_it_parts = [p for p in self.cached_warehouse_parts if p["pk"] not in matched_it_pks]
-        unlinked_count = len(unlinked_it_parts)
-        sep_row_idx = None
+        # Distinguish between unlinked parts and parts linked in OTHER tables
+        remaining_parts = [p for p in self.cached_warehouse_parts if p["pk"] not in matched_it_pks]
 
+        unlinked_it_parts: list[dict[str, Any]] = []
+        other_linked_parts: list[dict[str, Any]] = []
+
+        for p in remaining_parts:
+            pk = p["pk"]
+            linked_info = all_linked_across.get(pk)
+            if linked_info and linked_info[0] != self.current_altium_table:
+                other_tbl, other_row, l_data = linked_info
+                other_linked_parts.append({
+                    "part": p,
+                    "other_table": other_tbl,
+                    "other_row_id": other_row,
+                    "link_data": l_data,
+                })
+            else:
+                unlinked_it_parts.append(p)
+
+        unlinked_count = len(unlinked_it_parts)
+        other_linked_count = len(other_linked_parts)
+
+        sep_indices: list[int] = []
+
+        # Section 2: Unlinked Warehouse Parts
         if unlinked_it_parts:
-            sep_row_idx = len(aligned_rows)
+            sep_idx = len(aligned_rows)
+            sep_indices.append(sep_idx)
             sep_row = {
                 "is_separator": True,
-                "title": f"═══ Unlinked Warehouse Parts ({unlinked_count} parts not in Altium '{self.current_altium_table}') ═══",
+                "title": f"═══ Unlinked Warehouse Parts ({unlinked_count} parts not in Altium) ═══",
                 "status": "",
                 "ipn": "",
                 "name": "",
@@ -678,11 +809,54 @@ class WarehouseLinkWidget(QWidget):
                 }
                 aligned_rows.append(row_data)
 
+        # Section 3: Already Linked in Other Tables
+        if other_linked_parts:
+            sep_idx = len(aligned_rows)
+            sep_indices.append(sep_idx)
+            sep_row = {
+                "is_separator": True,
+                "title": f"═══ Already Linked to Other Tables ({other_linked_count} parts) ═══",
+                "status": "",
+                "ipn": "",
+                "name": "",
+                "stock": "",
+                "location": "",
+                "can_add": False,
+            }
+            aligned_rows.append(sep_row)
+
+            for item in sorted(other_linked_parts, key=lambda x: str(x["part"].get("IPN") or x["part"].get("name") or "")):
+                it_p = item["part"]
+                other_tbl = item["other_table"]
+                other_row = item["other_row_id"]
+
+                ipn_s = str(it_p.get("IPN") or "")
+                name_s = str(it_p.get("name") or "")
+                loc_s = str(it_p.get("location_name") or "")
+                if filter_text and filter_text not in f"{ipn_s} {name_s} {loc_s} {other_tbl}".lower():
+                    continue
+
+                row_data = {
+                    "status": "LINKED_OTHER",
+                    "other_table": other_tbl,
+                    "other_row_id": other_row,
+                    "altium_index": None,
+                    "altium_record": None,
+                    "inventree_part": it_p,
+                    "ipn": it_p.get("IPN") or "—",
+                    "name": it_p.get("name") or "—",
+                    "stock": it_p.get("total_in_stock"),
+                    "location": it_p.get("location_name") or "",
+                    "can_add": False,
+                }
+                aligned_rows.append(row_data)
+
         self.table_view.clearSpans()
         self.table_model.set_rows(aligned_rows)
 
-        if sep_row_idx is not None and sep_row_idx < len(aligned_rows):
-            self.table_view.setSpan(sep_row_idx, 0, 1, len(WarehouseTableModel.COLUMNS))
+        for s_idx in sep_indices:
+            if s_idx < len(aligned_rows):
+                self.table_view.setSpan(s_idx, 0, 1, len(WarehouseTableModel.COLUMNS))
 
         self._attach_action_buttons()
         self.rows_rebuilt.emit(len(aligned_rows))
@@ -690,12 +864,14 @@ class WarehouseLinkWidget(QWidget):
         total_wh = len(self.cached_warehouse_parts)
         self.lbl_stats.setText(
             f"<span style='color: #40ff80;'>🟢 {linked_count}</span> | "
-            f"<span style='color: #ffaa40;'>🟠 {unlinked_count}</span>"
+            f"<span style='color: #ffaa40;'>🟠 {unlinked_count}</span> | "
+            f"<span style='color: #d2a8ff;'>🔗 {other_linked_count}</span>"
         )
         self.lbl_stats.setToolTip(
             f"Warehouse Total: {total_wh} parts\n"
-            f"Linked to Altium: {linked_count}\n"
+            f"Linked to Current Table: {linked_count}\n"
             f"Unlinked in Warehouse: {unlinked_count}\n"
+            f"Linked in Other Tables: {other_linked_count}\n"
             f"Altium Unmatched: {unmatched_altium_count}"
         )
 
@@ -801,14 +977,18 @@ class WarehouseLinkWidget(QWidget):
                 container = QWidget()
                 h_layout = QHBoxLayout(container)
                 h_layout.setContentsMargins(2, 2, 2, 2)
+                h_layout.setSpacing(4)
                 h_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-                btn = QPushButton(" Add")
-                btn.setIcon(AppIcons.add("#ffffff"))
-                btn.setIconSize(QSize(11, 11))
-                btn.setFixedSize(72, 24)
-                btn.setToolTip("Add this part to Altium and link with warehouse")
-                btn.setStyleSheet("""
+                part_data = r.get("inventree_part")
+
+                # 1. Add to Altium button
+                btn_add = QPushButton(" Add")
+                btn_add.setIcon(AppIcons.add("#ffffff"))
+                btn_add.setIconSize(QSize(11, 11))
+                btn_add.setFixedSize(56, 24)
+                btn_add.setToolTip("Add this part to Altium library and link with warehouse")
+                btn_add.setStyleSheet("""
                     QPushButton {
                         background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #1f6feb, stop:1 #1158c7);
                         border: 1px solid #388bfd;
@@ -823,9 +1003,72 @@ class WarehouseLinkWidget(QWidget):
                         border-color: #58a6ff;
                     }
                 """)
-                part_data = r.get("inventree_part")
-                btn.clicked.connect(lambda ch=False, p=part_data: self._on_add_part_clicked(p))
-                h_layout.addWidget(btn)
+                btn_add.clicked.connect(lambda ch=False, p=part_data: self._on_add_part_clicked(p))
+                h_layout.addWidget(btn_add)
+
+                # 2. Link to selected Altium component button
+                btn_link = QPushButton(" Link to")
+                btn_link.setIcon(AppIcons.link("#ffffff"))
+                btn_link.setIconSize(QSize(11, 11))
+                btn_link.setFixedSize(68, 24)
+                btn_link.setToolTip("Link this warehouse part to the selected Altium component in the left table")
+                btn_link.setStyleSheet("""
+                    QPushButton {
+                        background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #238636, stop:1 #1a6328);
+                        border: 1px solid #2ea043;
+                        border-radius: 4px;
+                        color: #ffffff;
+                        font-size: 11px;
+                        font-weight: bold;
+                        padding: 0px;
+                    }
+                    QPushButton:hover {
+                        background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #2ea043, stop:1 #238636);
+                        border-color: #3fb950;
+                    }
+                """)
+                btn_link.clicked.connect(lambda ch=False, p=part_data: self.link_warehouse_to_altium_requested.emit(p))
+                h_layout.addWidget(btn_link)
+
+                self.table_view.setIndexWidget(index, container)
+
+            elif status == "LINKED_OTHER":
+                container = QWidget()
+                h_layout = QHBoxLayout(container)
+                h_layout.setContentsMargins(2, 2, 2, 2)
+                h_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+                other_tbl = r.get("other_table") or "Other"
+                other_row_id = r.get("other_row_id")
+                it_part = r.get("inventree_part")
+
+                btn_relink = QPushButton(" Re-link")
+                btn_relink.setIcon(AppIcons.link("#d2a8ff"))
+                btn_relink.setIconSize(QSize(11, 11))
+                btn_relink.setFixedSize(72, 24)
+                btn_relink.setToolTip(f"Part is currently linked in '{other_tbl}' (Row #{other_row_id}). Click to transfer link to selected Altium component in '{self.current_altium_table}'.")
+                btn_relink.setStyleSheet("""
+                    QPushButton {
+                        background-color: #2b1f3d;
+                        border: 1px solid #6e40c9;
+                        border-radius: 4px;
+                        color: #d2a8ff;
+                        font-size: 11px;
+                        font-weight: bold;
+                        padding: 0px;
+                    }
+                    QPushButton:hover {
+                        background-color: #3b2856;
+                        border-color: #bc8cff;
+                        color: #ffffff;
+                    }
+                """)
+                btn_relink.clicked.connect(lambda ch=False, p=it_part, ot=other_tbl, orid=other_row_id: self.relink_other_part_requested.emit({
+                    "inventree_part": p,
+                    "old_table": ot,
+                    "old_row_id": orid,
+                }))
+                h_layout.addWidget(btn_relink)
 
                 self.table_view.setIndexWidget(index, container)
             else:
@@ -861,6 +1104,33 @@ class WarehouseLinkWidget(QWidget):
 
             act_link_existing = menu.addAction(AppIcons.link(), f"Link '{ipn}' to Selected Altium Component")
             act_link_existing.triggered.connect(lambda: self.link_warehouse_to_altium_requested.emit(it_part))
+
+        elif status == "LINKED_OTHER":
+            ipn = it_part.get("IPN") or "Part" if it_part else "Part"
+            other_tbl = row_data.get("other_table") or "Other Table"
+            other_row_id = row_data.get("other_row_id")
+
+            act_relink = menu.addAction(AppIcons.link(), f"Transfer Link of '{ipn}' to Selected Altium Component...")
+            act_relink.triggered.connect(lambda: self.relink_other_part_requested.emit({
+                "inventree_part": it_part,
+                "old_table": other_tbl,
+                "old_row_id": other_row_id,
+            }))
+
+            act_unlink_other = menu.addAction(AppIcons.delete(), f"Unlink from '{other_tbl}' (Row #{other_row_id})")
+            act_unlink_other.triggered.connect(lambda: self._on_unlink_from_other_table(other_tbl, other_row_id, ipn))
+
+    def _on_unlink_from_other_table(self, other_table: str, other_row_id: int, ipn: str) -> None:
+        reply = QMessageBox.question(
+            self,
+            "Unlink from Other Table",
+            f"Are you sure you want to unlink warehouse part '{ipn}' from '{other_table}' (Row #{other_row_id})?\n\nIt will become an unlinked warehouse part.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self.link_manager.remove_link(other_table, other_row_id)
+            self._build_table_rows()
 
         menu.exec(self.table_view.viewport().mapToGlobal(pos))
 

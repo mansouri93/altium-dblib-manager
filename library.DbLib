@@ -153,3 +153,37 @@ Options=FieldName=IC-MCU.Stock|TableNameOnly=IC-MCU|FieldNameOnly=Stock|FieldTyp
 Options=FieldName=IC-MCU.Package|TableNameOnly=IC-MCU|FieldNameOnly=Package|FieldType=1|ParameterName=[Package]|VisibleOnAdd=False|AddMode=0|RemoveMode=0|UpdateMode=0
 [FieldMap50]
 Options=FieldName=IC-MCU.IPN|TableNameOnly=IC-MCU|FieldNameOnly=IPN|FieldType=1|ParameterName=[IPN]|VisibleOnAdd=False|AddMode=0|RemoveMode=0|UpdateMode=0
+[Table6]
+SchemaName=
+TableName=Discrete-Diode
+Enabled=True
+UserWhere=0
+UserWhereText=
+[FieldMap51]
+Options=FieldName=Discrete-Diode.Description|TableNameOnly=Discrete-Diode|FieldNameOnly=Description|FieldType=1|ParameterName=[Description]|VisibleOnAdd=False|AddMode=0|RemoveMode=0|UpdateMode=0
+[FieldMap52]
+Options=FieldName=Discrete-Diode.Part Number|TableNameOnly=Discrete-Diode|FieldNameOnly=Part Number|FieldType=0|ParameterName=Part Number|VisibleOnAdd=False|AddMode=0|RemoveMode=0|UpdateMode=0
+[FieldMap53]
+Options=FieldName=Discrete-Diode.Location|TableNameOnly=Discrete-Diode|FieldNameOnly=Location|FieldType=1|ParameterName=[Location]|VisibleOnAdd=False|AddMode=0|RemoveMode=0|UpdateMode=0
+[FieldMap54]
+Options=FieldName=Discrete-Diode.Stock|TableNameOnly=Discrete-Diode|FieldNameOnly=Stock|FieldType=1|ParameterName=[Stock]|VisibleOnAdd=False|AddMode=0|RemoveMode=0|UpdateMode=0
+[FieldMap55]
+Options=FieldName=Discrete-Diode.IPN|TableNameOnly=Discrete-Diode|FieldNameOnly=IPN|FieldType=1|ParameterName=[IPN]|VisibleOnAdd=False|AddMode=0|RemoveMode=0|UpdateMode=0
+[Table7]
+SchemaName=
+TableName=Inductors
+Enabled=True
+UserWhere=0
+UserWhereText=
+[FieldMap56]
+Options=FieldName=Inductors.Description|TableNameOnly=Inductors|FieldNameOnly=Description|FieldType=1|ParameterName=[Description]|VisibleOnAdd=False|AddMode=0|RemoveMode=0|UpdateMode=0
+[FieldMap57]
+Options=FieldName=Inductors.Part Number|TableNameOnly=Inductors|FieldNameOnly=Part Number|FieldType=0|ParameterName=Part Number|VisibleOnAdd=False|AddMode=0|RemoveMode=0|UpdateMode=0
+[FieldMap58]
+Options=FieldName=Inductors.Location|TableNameOnly=Inductors|FieldNameOnly=Location|FieldType=1|ParameterName=[Location]|VisibleOnAdd=False|AddMode=0|RemoveMode=0|UpdateMode=0
+[FieldMap59]
+Options=FieldName=Inductors.Stock|TableNameOnly=Inductors|FieldNameOnly=Stock|FieldType=1|ParameterName=[Stock]|VisibleOnAdd=False|AddMode=0|RemoveMode=0|UpdateMode=0
+[FieldMap60]
+Options=FieldName=Inductors.Package|TableNameOnly=Inductors|FieldNameOnly=Package|FieldType=1|ParameterName=[Package]|VisibleOnAdd=False|AddMode=0|RemoveMode=0|UpdateMode=0
+[FieldMap61]
+Options=FieldName=Inductors.IPN|TableNameOnly=Inductors|FieldNameOnly=IPN|FieldType=1|ParameterName=[IPN]|VisibleOnAdd=False|AddMode=0|RemoveMode=0|UpdateMode=0

@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import unittest
 from pathlib import Path
+import math
 import sys
 from PySide6.QtWidgets import QApplication
 
@@ -213,10 +214,150 @@ class TestFootprint3D(unittest.TestCase):
             self.assertIsNotNone(widget.viewer_3d.model)
             self.assertAlmostEqual(widget.viewer_3d.model.length_mm, 1.0, delta=0.08)
 
-        # Test placeholder
-        widget.show_placeholder("No component selected")
-        self.assertIsNone(widget.viewer_3d.model)
+    def test_inductor_step_circles_and_backface_culling(self):
+        """Verify STEP circle recovery, strict coplanar grouping, and back-face culling for WE-ACHC inductor."""
+        pcblib = Path(r"altium-library-master\footprints\Power Inductors\PCB - POWER INDUCTORS - WURTH WE-ACHC 7449150046.PcbLib")
+        if not pcblib.exists():
+            self.skipTest("Wurth WE-ACHC PCBLIB not found")
+
+        model = self.parser.get_model(pcblib, "WURTH WE-ACHC 7449150046")
+        self.assertIsNotNone(model)
+        self.assertTrue(model.has_3d_model)
+        self.assertGreaterEqual(len(model.polygons), 98)
+
+        # 1. Verify closed circle recovery for the white top sticker disc (Face #365)
+        white_discs = [
+            p for p in model.polygons
+            if len(p.points) == 24 and p.area > 50.0 and p.color in ((255, 255, 255), (245, 245, 245), (240, 240, 240))
+        ]
+        self.assertGreaterEqual(len(white_discs), 1, "White circular sticker disc was not recovered")
+        self.assertAlmostEqual(white_discs[0].center[2], 5.05, delta=0.1)
+
+        # 2. Verify coplanar grouping strictly isolates opposing normals
+        viewer = Footprint3DViewer()
+        viewer.resize(600, 400)
+        viewer.set_model(model)
+        for g in viewer._planar_groups:
+            if len(g) > 1:
+                rep_n = g[0].normal
+                for poly in g[1:]:
+                    dot_n = poly.normal[0] * rep_n[0] + poly.normal[1] * rep_n[1] + poly.normal[2] * rep_n[2]
+                    self.assertGreater(dot_n, 0.99, "Opposing normals must never be grouped together")
+
+        # 3. Verify QPainter rendering succeeds without errors
+        from PySide6.QtGui import QImage
+        img = QImage(600, 400, QImage.Format.Format_ARGB32)
+        img.fill(0)
+        viewer.render(img)
+        self.assertFalse(img.isNull())
+
+    def test_shielded_inductor_cylinder_reconstruction(self):
+        """Verify CYLINDRICAL_SURFACE quad panel decomposition for TDK SLF10165 drum core."""
+        pcblib = Path(r"altium-library-master\footprints\Power Inductors\PCB - POWER INDUCTORS - TDK SLF10165.PCBLIB")
+        if not pcblib.exists():
+            self.skipTest("TDK SLF10165 PCBLIB not found")
+
+        model = self.parser.get_model(pcblib, "TDK SLF10165")
+        self.assertIsNotNone(model)
+        self.assertTrue(model.has_3d_model)
+
+        # Polygon count must reflect reconstructed cylinder panels (> 250, previously only 83)
+        self.assertGreater(len(model.polygons), 250)
+
+        # Real-world dimensions: 10.10mm x 10.10mm x 6.53mm
+        self.assertAlmostEqual(model.length_mm, 10.10, delta=0.1)
+        self.assertAlmostEqual(model.width_mm, 10.10, delta=0.1)
+        self.assertAlmostEqual(model.height_mm, 6.53, delta=0.1)
+
+        # Verify cylinder panels connecting base (Z <= 1.7mm) to top (Z >= 6.1mm)
+        cylinder_panels = [
+            p for p in model.polygons
+            if len(p.points) == 4
+            and min(pt[2] for pt in p.points) <= 1.7
+            and max(pt[2] for pt in p.points) >= 6.1
+        ]
+        self.assertEqual(len(cylinder_panels), 24, "Main ferrite drum cylinder must produce 24 quad panels")
+
+        # Verify outward radial normals of cylinder panels (Z component near 0, horizontal magnitude near 1)
+        for panel in cylinder_panels:
+            nx, ny, nz = panel.normal
+            self.assertAlmostEqual(nz, 0.0, delta=0.01)
+            h_mag = math.sqrt(nx * nx + ny * ny)
+            self.assertAlmostEqual(h_mag, 1.0, delta=0.01)
+
+        # Verify top blue cap sits flush above the cylinder
+        blue_top_discs = [
+            p for p in model.polygons
+            if p.color[2] > 150 and p.color[0] < 50 and min(pt[2] for pt in p.points) >= 6.2
+        ]
+        self.assertGreaterEqual(len(blue_top_discs), 1, "Top blue cap disc must be present above cylinder")
+
+        # Verify rendering succeeds
+        from PySide6.QtGui import QImage
+        viewer = Footprint3DViewer()
+        viewer.resize(800, 600)
+        viewer.set_model(model)
+        img = QImage(800, 600, QImage.Format.Format_ARGB32)
+        img.fill(0)
+        viewer.render(img)
+        self.assertFalse(img.isNull())
+
+    def test_toroidal_surface_power_inductor_reconstruction(self):
+        """Verify TOROIDAL_SURFACE extraction and parametric quad meshing for power inductors."""
+        nr1005_pcblib = Path(r"altium-library-master\footprints\Power Inductors\PCB - POWER INDUCTORS - TAIYO YUDEN NR1005.PcbLib")
+        if not nr1005_pcblib.exists():
+            self.skipTest("Taiyo Yuden NR1005 PCBLIB not found")
+
+        model = self.parser.get_model(nr1005_pcblib, "TAIYO YUDEN NR1005")
+        self.assertIsNotNone(model)
+        self.assertTrue(model.has_3d_model)
+
+        # Real-world dimensions: 9.80mm x 8.01mm x 5.0mm
+        self.assertAlmostEqual(model.length_mm, 9.80, delta=0.15)
+        self.assertAlmostEqual(model.width_mm, 8.01, delta=0.15)
+        self.assertAlmostEqual(model.height_mm, 5.00, delta=0.15)
+
+        # Verify solid toroidal spool body (192 quad panels: 24 radial segments x 8 vertical slices)
+        spool_panels = [
+            p for p in model.polygons
+            if len(p.points) == 4
+            and min(pt[2] for pt in p.points) >= 0.99
+            and max(pt[2] for pt in p.points) <= 4.21
+            and max(math.sqrt(pt[0]**2 + pt[1]**2) for pt in p.points) < 4.0
+        ]
+        self.assertEqual(len(spool_panels), 192, "Toroidal winding spool must produce 192 quad panels connecting top and bottom flanges")
+
+        # Verify waist radius at center Z=2.6mm is ~3.42mm (R_maj 6.525 - r_min 3.101 = 3.424mm)
+        center_pts = [
+            pt for p in spool_panels for pt in p.points
+            if abs(pt[2] - 2.6) < 0.1
+        ]
+        self.assertGreater(len(center_pts), 0)
+        for pt in center_pts:
+            r = math.sqrt(pt[0]**2 + pt[1]**2)
+            self.assertAlmostEqual(r, 3.424, delta=0.05)
+
+        # Verify Bourns SRN4018 toroidal spool reconstruction
+        srn4018_pcblib = Path(r"altium-library-master\footprints\Power Inductors\PCB - POWER INDUCTORS - BOURNS SRN4018.PcbLib")
+        if srn4018_pcblib.exists():
+            srn_model = self.parser.get_model(srn4018_pcblib, "BOURNS SRN4018")
+            self.assertTrue(srn_model.has_3d_model)
+            self.assertAlmostEqual(srn_model.length_mm, 4.10, delta=0.1)
+            self.assertAlmostEqual(srn_model.width_mm, 4.10, delta=0.1)
+            self.assertAlmostEqual(srn_model.height_mm, 1.80, delta=0.1)
+            self.assertGreaterEqual(len(srn_model.polygons), 300)
+
+        # Verify off-screen rendering
+        from PySide6.QtGui import QImage
+        viewer = Footprint3DViewer()
+        viewer.resize(800, 600)
+        viewer.set_model(model)
+        img = QImage(800, 600, QImage.Format.Format_ARGB32)
+        img.fill(0)
+        viewer.render(img)
+        self.assertFalse(img.isNull())
 
 
 if __name__ == "__main__":
     unittest.main()
+

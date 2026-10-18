@@ -205,9 +205,10 @@ class InvenTreeClient:
             logger.error(f"Error fetching categories from InvenTree: {exc}")
             return []
 
-    def get_parts_by_categories(self, category_ids: list[int], limit_per_cat: int = 500) -> list[dict[str, Any]]:
-        """Fetch all parts belonging to the specified categories (with subcategories cascade)."""
-        if not category_ids:
+    def get_parts_by_categories(self, category_ids: list[int] | set[int], limit_per_cat: int = 1000) -> list[dict[str, Any]]:
+        """Fetch all parts belonging to the specified categories (with subcategories cascade and pagination)."""
+        target_set = {int(x) for x in category_ids if x is not None}
+        if not target_set:
             return []
 
         # Ensure locations are cached
@@ -216,20 +217,61 @@ class InvenTreeClient:
 
         try:
             token = self._get_token()
-            unique_parts = {}
-            for cat_id in category_ids:
-                res = api_get(self.conn, f"/api/part/?category={cat_id}&cascade=true&limit={limit_per_cat}", token=token)
-                parts = res if isinstance(res, list) else res.get("results", [])
-                for p in parts:
-                    pk = p.get("pk")
-                    if pk and pk not in unique_parts:
-                        def_loc = p.get("default_location")
-                        loc_str = self._location_cache.get(def_loc, "") if def_loc else ""
-                        p["location_name"] = loc_str
-                        unique_parts[pk] = p
+
+            # Find query roots: categories in target_set whose ancestors are NOT in target_set.
+            # This avoids redundant nested calls while guaranteeing 100% cascade coverage.
+            all_cats = self.get_all_categories()
+            parent_map: dict[int, int | None] = {
+                c["pk"]: c.get("parent") for c in all_cats if isinstance(c, dict) and "pk" in c
+            }
+
+            query_roots: list[int] = []
+            for cid in target_set:
+                has_ancestor_in_set = False
+                curr = parent_map.get(cid)
+                while curr is not None:
+                    if curr in target_set:
+                        has_ancestor_in_set = True
+                        break
+                    curr = parent_map.get(curr)
+                if not has_ancestor_in_set:
+                    query_roots.append(cid)
+
+            if not query_roots:
+                query_roots = list(target_set)
+
+            unique_parts: dict[int, dict[str, Any]] = {}
+            for cat_id in query_roots:
+                next_url: str | None = f"/api/part/?category={cat_id}&cascade=true&limit={limit_per_cat}"
+                while next_url:
+                    res = api_get(self.conn, next_url, token=token)
+                    if isinstance(res, list):
+                        parts = res
+                        next_url = None
+                    elif isinstance(res, dict):
+                        parts = res.get("results", [])
+                        next_full = res.get("next")
+                        if next_full:
+                            parsed = urllib.parse.urlparse(next_full)
+                            next_url = parsed.path + ("?" + parsed.query if parsed.query else "")
+                        else:
+                            next_url = None
+                    else:
+                        break
+
+                    for p in parts:
+                        pk = p.get("pk")
+                        if pk and pk not in unique_parts:
+                            def_loc = p.get("default_location")
+                            loc_str = self._location_cache.get(def_loc, "") if def_loc else ""
+                            p["location_name"] = loc_str
+                            unique_parts[pk] = p
 
             # For parts with stock > 0 but no default location, query stock items in batch
-            parts_needing_loc = [p for p in unique_parts.values() if not p.get("location_name") and float(p.get("total_in_stock") or 0) > 0]
+            parts_needing_loc = [
+                p for p in unique_parts.values()
+                if not p.get("location_name") and float(p.get("total_in_stock") or 0) > 0
+            ]
             if parts_needing_loc:
                 try:
                     stock_res = api_get(self.conn, "/api/stock/?in_stock=true&limit=1000", token=token)
@@ -408,6 +450,13 @@ class ComponentLinkManager:
             ipn_val = str(ipn or "")
             name_val = str(name or ipn_val)
 
+        # Enforce single link constraint: A warehouse part can only be linked to ONE library component
+        if pk_val > 0:
+            for existing_key, link_data in list(self._links.items()):
+                if existing_key != key and not link_data.get("unlinked") and link_data.get("inventree_pk") == pk_val:
+                    logger.info(f"Unlinking {existing_key} because InvenTree PK {pk_val} was re-linked to {key}")
+                    link_data["unlinked"] = True
+
         self._links[key] = {
             "inventree_pk": pk_val,
             "inventree_ipn": ipn_val,
@@ -448,7 +497,7 @@ class ComponentLinkManager:
         return result
 
     def find_by_inventree_pk(self, table_name: str, pk: int) -> int | None:
-        """Find the Access row_id linked to the given InvenTree PK."""
+        """Find the Access row_id linked to the given InvenTree PK in the specified table."""
         prefix = f"{table_name.strip()}:"
         for k, v in self._links.items():
             if k.startswith(prefix) and not v.get("unlinked") and v.get("inventree_pk") == pk:
@@ -458,8 +507,35 @@ class ComponentLinkManager:
                     pass
         return None
 
+    def find_linked_component_by_pk(self, pk: int) -> tuple[str, int, dict[str, Any]] | None:
+        """Find (table_name, row_id, link_data) linked to given InvenTree PK across all tables."""
+        if not pk:
+            return None
+        for k, v in self._links.items():
+            if not v.get("unlinked") and v.get("inventree_pk") == pk:
+                parts = k.split(":", 1)
+                if len(parts) == 2:
+                    try:
+                        return parts[0], int(parts[1]), v
+                    except ValueError:
+                        pass
+        return None
+
+    def get_all_linked_parts_across_tables(self) -> dict[int, tuple[str, int, dict[str, Any]]]:
+        """Return a mapping of InvenTree PK -> (table_name, row_id, link_dict) for all active links across the library."""
+        res: dict[int, tuple[str, int, dict[str, Any]]] = {}
+        for k, v in self._links.items():
+            if not v.get("unlinked") and v.get("inventree_pk"):
+                parts = k.split(":", 1)
+                if len(parts) == 2:
+                    try:
+                        res[int(v["inventree_pk"])] = (parts[0], int(parts[1]), v)
+                    except (ValueError, TypeError):
+                        pass
+        return res
+
     def find_by_inventree_ipn(self, table_name: str, ipn: str) -> int | None:
-        """Find the Access row_id linked to the given InvenTree IPN."""
+        """Find the Access row_id linked to the given InvenTree IPN in the specified table."""
         if not ipn:
             return None
         ipn_norm = ipn.strip().lower()
@@ -472,4 +548,81 @@ class ComponentLinkManager:
                     except ValueError:
                         pass
         return None
+
+
+class TableCategoryManager:
+    """
+    Manages associations between Altium library tables and InvenTree category IDs.
+    Persists mappings in .cache/table_categories.json.
+    """
+
+    def __init__(self, cache_dir: Path = CACHE_DIR) -> None:
+        self.cache_dir = Path(cache_dir)
+        self.file_path = self.cache_dir / "table_categories.json"
+        self._data: dict[str, list[int]] = {}
+        self._load()
+
+    def _load(self) -> None:
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        if self.file_path.exists():
+            try:
+                with open(self.file_path, "r", encoding="utf-8-sig") as fp:
+                    raw = json.load(fp)
+                    if isinstance(raw, dict):
+                        self._data = {
+                            str(k).strip(): [
+                                int(x)
+                                for x in v
+                                if isinstance(x, (int, str)) and str(x).isdigit()
+                            ]
+                            for k, v in raw.items()
+                            if isinstance(v, list)
+                        }
+            except Exception as exc:
+                logger.error(f"Failed to load table categories from {self.file_path}: {exc}")
+                self._data = {}
+        else:
+            self._data = {}
+
+    def _save(self) -> None:
+        try:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            with open(self.file_path, "w", encoding="utf-8") as fp:
+                json.dump(self._data, fp, indent=2, ensure_ascii=False)
+        except Exception as exc:
+            logger.error(f"Failed to save table categories to {self.file_path}: {exc}")
+
+    def get_table_categories(self, table_name: str) -> list[int]:
+        """Return the list of InvenTree category IDs configured for the table. Empty list if none."""
+        if not table_name:
+            return []
+        return list(self._data.get(table_name.strip(), []))
+
+    def set_table_categories(self, table_name: str, category_ids: list[int] | set[int]) -> None:
+        """Configure InvenTree category IDs for a table."""
+        if not table_name:
+            return
+        clean_name = table_name.strip()
+        clean_ids = sorted(list({int(c) for c in category_ids if c is not None}))
+        self._data[clean_name] = clean_ids
+        self._save()
+        logger.info(f"Saved {len(clean_ids)} warehouse categories for table '{clean_name}'")
+
+    def remove_table(self, table_name: str) -> None:
+        """Remove table configuration when a table is deleted."""
+        clean_name = table_name.strip()
+        if clean_name in self._data:
+            del self._data[clean_name]
+            self._save()
+            logger.info(f"Removed warehouse categories for deleted table '{clean_name}'")
+
+    def rename_table(self, old_name: str, new_name: str) -> None:
+        """Update table key when a table is renamed."""
+        old_k = old_name.strip()
+        new_k = new_name.strip()
+        if old_k in self._data:
+            self._data[new_k] = self._data.pop(old_k)
+            self._save()
+            logger.info(f"Renamed warehouse categories key from '{old_k}' to '{new_k}'")
+
 

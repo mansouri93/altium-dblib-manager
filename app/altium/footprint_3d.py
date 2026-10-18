@@ -470,6 +470,27 @@ class Footprint3DParser:
             ))
             axes[aid] = (orig, xn, yn, zn)
 
+        # 4b. Circles and B-Splines for curved edge recovery
+        circles: dict[int, tuple[int, float]] = {}
+        for m in re.finditer(r"#(\d+)\s*=\s*CIRCLE\s*\(\s*'[^']*'\s*,\s*#(\d+)\s*,\s*([eE0-9\.\-\+]+)\s*\)", step_text):
+            circles[int(m.group(1))] = (int(m.group(2)), float(m.group(3)) * unit_scale)
+
+        bsplines: dict[int, list[int]] = {}
+        for m in re.finditer(r"#(\d+)\s*=\s*B_SPLINE_CURVE_WITH_KNOTS\s*\(\s*'[^']*'\s*,\s*\d+\s*,\s*\(([\s#\d,]+)\)", step_text):
+            cid = int(m.group(1))
+            cp_ids = [int(x.replace("#", "").strip()) for x in m.group(2).split(",") if x.strip()]
+            bsplines[cid] = cp_ids
+
+        # 4c. Cylindrical surfaces for solid 3D cylinder reconstruction
+        cylinders: dict[int, tuple[int, float]] = {}
+        for m in re.finditer(r"#(\d+)\s*=\s*CYLINDRICAL_SURFACE\s*\(\s*'[^']*'\s*,\s*#(\d+)\s*,\s*([eE0-9\.\-\+]+)\s*\)", step_text):
+            cylinders[int(m.group(1))] = (int(m.group(2)), float(m.group(3)) * unit_scale)
+
+        # 4d. Toroidal surfaces for winding spools and curved drums
+        toroids: dict[int, tuple[int, float, float]] = {}
+        for m in re.finditer(r"#(\d+)\s*=\s*TOROIDAL_SURFACE\s*\(\s*'[^']*'\s*,\s*#(\d+)\s*,\s*([eE0-9\.\-\+]+)\s*,\s*([eE0-9\.\-\+]+)\s*\)", step_text):
+            toroids[int(m.group(1))] = (int(m.group(2)), float(m.group(3)) * unit_scale, float(m.group(4)) * unit_scale)
+
         # 5. Transformations
         re_trans = re.compile(r"#(\d+)\s*=\s*ITEM_DEFINED_TRANSFORMATION\s*\(\s*[^,]*,\s*[^,]*,\s*#(\d+)\s*,\s*#(\d+)\s*\)")
         trans_map = {int(m.group(1)): (int(m.group(2)), int(m.group(3))) for m in re_trans.finditer(step_text)}
@@ -491,7 +512,7 @@ class Footprint3DParser:
 
         # 7. Geometry entities
         vertex_points = {int(m.group(1)): int(m.group(2)) for m in re.finditer(r"#(\d+)\s*=\s*VERTEX_POINT\s*\(\s*'[^']*'\s*,\s*#(\d+)\s*\)", step_text)}
-        edge_curves = {int(m.group(1)): (int(m.group(2)), int(m.group(3))) for m in re.finditer(r"#(\d+)\s*=\s*EDGE_CURVE\s*\(\s*'[^']*'\s*,\s*#(\d+)\s*,\s*#(\d+)", step_text)}
+        edge_curves = {int(m.group(1)): (int(m.group(2)), int(m.group(3)), int(m.group(4))) for m in re.finditer(r"#(\d+)\s*=\s*EDGE_CURVE\s*\(\s*'[^']*'\s*,\s*#(\d+)\s*,\s*#(\d+)\s*,\s*#(\d+)", step_text)}
         oriented_edges = {int(m.group(1)): (int(m.group(2)), m.group(3) == ".T.") for m in re.finditer(r"#(\d+)\s*=\s*ORIENTED_EDGE\s*\(\s*'[^']*'\s*,\s*\*,\s*\*,\s*#(\d+)\s*,\s*(\.[TF]\.)\s*\)", step_text)}
         edge_loops = {
             int(m.group(1)): [int(x.replace("#", "").strip()) for x in m.group(2).split(",") if x.strip()]
@@ -504,11 +525,13 @@ class Footprint3DParser:
         re_fb = re.compile(r"#(\d+)\s*=\s*FACE_(?:OUTER_)?BOUND\s*\(\s*'[^']*'\s*,\s*#(\d+)")
         all_face_bounds = {int(m.group(1)): int(m.group(2)) for m in re_fb.finditer(step_text)}
 
-        re_af = re.compile(r"#(\d+)\s*=\s*ADVANCED_FACE\s*\(\s*'[^']*'\s*,\s*\(([\s#\d,]+)\)")
-        advanced_faces = {
-            int(m.group(1)): [int(x.replace("#", "").strip()) for x in m.group(2).split(",") if x.strip()]
-            for m in re_af.finditer(step_text)
-        }
+        re_af = re.compile(r"#(\d+)\s*=\s*ADVANCED_FACE\s*\(\s*'[^']*'\s*,\s*\(([\s#\d,]+)\)(?:\s*,\s*#(\d+))?")
+        advanced_faces: dict[int, tuple[list[int], int | None]] = {}
+        for m in re_af.finditer(step_text):
+            fid = int(m.group(1))
+            b_ids = [int(x.replace("#", "").strip()) for x in m.group(2).split(",") if x.strip()]
+            surf_id = int(m.group(3)) if m.group(3) else None
+            advanced_faces[fid] = (b_ids, surf_id)
 
         shell_to_faces: dict[int, list[int]] = {}
         for m in re.finditer(r"#(\d+)\s*=\s*(?:CLOSED_SHELL|OPEN_SHELL)\s*\(\s*'[^']*'\s*,\s*\(([\s#\d,]+)\)", step_text):
@@ -516,8 +539,8 @@ class Footprint3DParser:
             fids = [int(x.replace("#", "").strip()) for x in m.group(2).split(",") if x.strip()]
             shell_to_faces[sid] = fids
 
-        face_polygons: dict[int, list[tuple[float, float, float]]] = {}
-        for fid, b_ids in advanced_faces.items():
+        face_polygons: dict[int, list[list[tuple[float, float, float]]]] = {}
+        for fid, (b_ids, surf_id) in advanced_faces.items():
             # Strictly prefer FACE_OUTER_BOUND over inner holes (FACE_BOUND)
             outer_bid = None
             for bid in b_ids:
@@ -534,21 +557,221 @@ class Footprint3DParser:
             if not lid or lid not in edge_loops:
                 continue
 
+            loop_edges = edge_loops[lid]
+
+            # 1. Cylindrical surface quad-panel decomposition (e.g. inductor ferrite drums, can capacitors)
+            if surf_id is not None and surf_id in cylinders:
+                ax_id, rad = cylinders[surf_id]
+                if ax_id in axes and rad > 0:
+                    orig, xn, yn, zn = axes[ax_id]
+                    h_vals: list[float] = []
+                    has_closed_circle = False
+                    circular_edges: list[tuple[float, float, float, bool]] = []
+                    h_to_circ: dict[float, list[float]] = {}
+
+                    for oe in loop_edges:
+                        if oe not in oriented_edges:
+                            continue
+                        ec, forward = oriented_edges[oe]
+                        if ec not in edge_curves:
+                            continue
+                        v1, v2, cid = edge_curves[ec]
+                        p1 = points.get(vertex_points.get(v1))
+                        p2 = points.get(vertex_points.get(v2))
+                        for p in (p1, p2):
+                            if p is not None:
+                                h = (p[0] - orig[0]) * zn[0] + (p[1] - orig[1]) * zn[1] + (p[2] - orig[2]) * zn[2]
+                                h_vals.append(h)
+                        if cid in circles:
+                            if v1 == v2:
+                                has_closed_circle = True
+                            elif p1 is not None and p2 is not None:
+                                h1 = (p1[0] - orig[0]) * zn[0] + (p1[1] - orig[1]) * zn[1] + (p1[2] - orig[2]) * zn[2]
+                                h2 = (p2[0] - orig[0]) * zn[0] + (p2[1] - orig[1]) * zn[1] + (p2[2] - orig[2]) * zn[2]
+                                h_avg = round((h1 + h2) / 2.0, 2)
+                                th1 = math.atan2(
+                                    (p1[0] - orig[0]) * yn[0] + (p1[1] - orig[1]) * yn[1] + (p1[2] - orig[2]) * yn[2],
+                                    (p1[0] - orig[0]) * xn[0] + (p1[1] - orig[1]) * xn[1] + (p1[2] - orig[2]) * xn[2],
+                                )
+                                th2 = math.atan2(
+                                    (p2[0] - orig[0]) * yn[0] + (p2[1] - orig[1]) * yn[1] + (p2[2] - orig[2]) * yn[2],
+                                    (p2[0] - orig[0]) * xn[0] + (p2[1] - orig[1]) * xn[1] + (p2[2] - orig[2]) * xn[2],
+                                )
+                                dth = (th2 - th1) if forward else (th1 - th2)
+                                while dth < 0:
+                                    dth += 2.0 * math.pi
+                                while dth > 2.0 * math.pi:
+                                    dth -= 2.0 * math.pi
+                                circular_edges.append((th1, th2, dth, forward))
+                                h_to_circ.setdefault(h_avg, []).append(dth)
+
+                    if h_vals:
+                        h_min = min(h_vals)
+                        h_max = max(h_vals)
+                        delta_h = h_max - h_min
+                        if delta_h >= 0.08:
+                            max_arc_at_h = max((sum(v) for v in h_to_circ.values()), default=0.0)
+                            is_full = has_closed_circle or max_arc_at_h >= 5.5
+                            panels: list[list[tuple[float, float, float]]] = []
+
+                            def make_cyl_pt(ang: float, h: float) -> tuple[float, float, float]:
+                                return (
+                                    orig[0] + h * zn[0] + rad * (math.cos(ang) * xn[0] + math.sin(ang) * yn[0]),
+                                    orig[1] + h * zn[1] + rad * (math.cos(ang) * xn[1] + math.sin(ang) * yn[1]),
+                                    orig[2] + h * zn[2] + rad * (math.cos(ang) * xn[2] + math.sin(ang) * yn[2]),
+                                )
+
+                            if is_full:
+                                n_panels = 24
+                                for i in range(n_panels):
+                                    a1 = 2.0 * math.pi * i / n_panels
+                                    a2 = 2.0 * math.pi * (i + 1) / n_panels
+                                    panels.append([
+                                        make_cyl_pt(a1, h_min),
+                                        make_cyl_pt(a2, h_min),
+                                        make_cyl_pt(a2, h_max),
+                                        make_cyl_pt(a1, h_max),
+                                    ])
+
+                            if panels:
+                                face_polygons[fid] = panels
+                                continue
+
+            # 1b. Toroidal surface quad-panel decomposition (e.g. inductor concave winding spools)
+            if surf_id is not None and surf_id in toroids:
+                ax_id, r_maj, r_min = toroids[surf_id]
+                if ax_id in axes and r_min > 0:
+                    orig, xn, yn, zn = axes[ax_id]
+                    h_vals: list[float] = []
+                    has_closed_circle = False
+                    circular_edges: list[tuple[float, float, float, bool]] = []
+                    b_radii: list[float] = []
+                    h_to_circ: dict[float, list[float]] = {}
+
+                    for oe in loop_edges:
+                        if oe not in oriented_edges:
+                            continue
+                        ec, forward = oriented_edges[oe]
+                        if ec not in edge_curves:
+                            continue
+                        v1, v2, cid = edge_curves[ec]
+                        p1 = points.get(vertex_points.get(v1))
+                        p2 = points.get(vertex_points.get(v2))
+                        for p in (p1, p2):
+                            if p is not None:
+                                h = (p[0] - orig[0]) * zn[0] + (p[1] - orig[1]) * zn[1] + (p[2] - orig[2]) * zn[2]
+                                h_vals.append(h)
+                                px, py, pz = p[0] - orig[0], p[1] - orig[1], p[2] - orig[2]
+                                dot_z = px * zn[0] + py * zn[1] + pz * zn[2]
+                                perp_x = px - dot_z * zn[0]
+                                perp_y = py - dot_z * zn[1]
+                                perp_z = pz - dot_z * zn[2]
+                                b_radii.append(math.sqrt(perp_x * perp_x + perp_y * perp_y + perp_z * perp_z))
+                        if cid in circles:
+                            c_ax, c_rad = circles[cid]
+                            b_radii.append(c_rad)
+                            if v1 == v2:
+                                has_closed_circle = True
+                            elif p1 is not None and p2 is not None:
+                                h1 = (p1[0] - orig[0]) * zn[0] + (p1[1] - orig[1]) * zn[1] + (p1[2] - orig[2]) * zn[2]
+                                h2 = (p2[0] - orig[0]) * zn[0] + (p2[1] - orig[1]) * zn[1] + (p2[2] - orig[2]) * zn[2]
+                                h_avg = round((h1 + h2) / 2.0, 2)
+                                th1 = math.atan2(
+                                    (p1[0] - orig[0]) * yn[0] + (p1[1] - orig[1]) * yn[1] + (p1[2] - orig[2]) * yn[2],
+                                    (p1[0] - orig[0]) * xn[0] + (p1[1] - orig[1]) * xn[1] + (p1[2] - orig[2]) * xn[2],
+                                )
+                                th2 = math.atan2(
+                                    (p2[0] - orig[0]) * yn[0] + (p2[1] - orig[1]) * yn[1] + (p2[2] - orig[2]) * yn[2],
+                                    (p2[0] - orig[0]) * xn[0] + (p2[1] - orig[1]) * xn[1] + (p2[2] - orig[2]) * xn[2],
+                                )
+                                dth = (th2 - th1) if forward else (th1 - th2)
+                                while dth < 0:
+                                    dth += 2.0 * math.pi
+                                while dth > 2.0 * math.pi:
+                                    dth -= 2.0 * math.pi
+                                circular_edges.append((th1, th2, dth, forward))
+                                h_to_circ.setdefault(h_avg, []).append(dth)
+
+                    if h_vals:
+                        h_min = min(h_vals)
+                        h_max = max(h_vals)
+                        delta_h = h_max - h_min
+                        if delta_h >= 0.4 and r_min >= 0.4:
+                            max_arc_at_h = max((sum(v) for v in h_to_circ.values()), default=0.0)
+                            is_full = has_closed_circle or max_arc_at_h >= 5.5
+                            if is_full:
+                                avg_r = (sum(b_radii) / len(b_radii)) if b_radii else (r_maj - r_min)
+                                sign = -1.0 if avg_r < r_maj else 1.0
+
+                                def make_torus_pt(ang: float, h_val: float) -> tuple[float, float, float]:
+                                    under_sqrt = max(0.0, r_min * r_min - h_val * h_val)
+                                    cur_r = max(0.01, r_maj + sign * math.sqrt(under_sqrt))
+                                    return (
+                                        orig[0] + h_val * zn[0] + cur_r * (math.cos(ang) * xn[0] + math.sin(ang) * yn[0]),
+                                        orig[1] + h_val * zn[1] + cur_r * (math.cos(ang) * xn[1] + math.sin(ang) * yn[1]),
+                                        orig[2] + h_val * zn[2] + cur_r * (math.cos(ang) * xn[2] + math.sin(ang) * yn[2]),
+                                    )
+
+                                panels = []
+                                n_th = 24
+                                n_z = 8
+                                for iz in range(n_z):
+                                    hz1 = h_min + delta_h * iz / n_z
+                                    hz2 = h_min + delta_h * (iz + 1) / n_z
+                                    for it in range(n_th):
+                                        a1 = 2.0 * math.pi * it / n_th
+                                        a2 = 2.0 * math.pi * (it + 1) / n_th
+                                        panels.append([
+                                            make_torus_pt(a1, hz1),
+                                            make_torus_pt(a2, hz1),
+                                            make_torus_pt(a2, hz2),
+                                            make_torus_pt(a1, hz2),
+                                        ])
+
+                                if panels:
+                                    face_polygons[fid] = panels
+                                    continue
+
+            # 2. Closed circle or B-spline loop recovery
             pts: list[tuple[float, float, float]] = []
-            for oe in edge_loops[lid]:
-                if oe not in oriented_edges:
-                    continue
-                ec, forward = oriented_edges[oe]
-                if ec not in edge_curves:
-                    continue
-                v1, v2 = edge_curves[ec]
-                v_sel = v1 if forward else v2
-                pt_id = vertex_points.get(v_sel)
-                if pt_id and pt_id in points:
-                    pts.append(points[pt_id])
+            if len(loop_edges) == 1:
+                oe = loop_edges[0]
+                if oe in oriented_edges:
+                    ec, forward = oriented_edges[oe]
+                    if ec in edge_curves:
+                        v1, v2, cid = edge_curves[ec]
+                        if cid in circles and v1 == v2:
+                            ax_id, rad = circles[cid]
+                            if ax_id in axes:
+                                orig, xn, yn, zn = axes[ax_id]
+                                n_samples = 24
+                                for k in range(n_samples):
+                                    ang = 2.0 * math.pi * k / n_samples if forward else 2.0 * math.pi * (n_samples - k) / n_samples
+                                    pts.append((
+                                        orig[0] + rad * (math.cos(ang) * xn[0] + math.sin(ang) * yn[0]),
+                                        orig[1] + rad * (math.cos(ang) * xn[1] + math.sin(ang) * yn[1]),
+                                        orig[2] + rad * (math.cos(ang) * xn[2] + math.sin(ang) * yn[2]),
+                                    ))
+                        elif cid in bsplines and v1 == v2:
+                            cps = [points[pid] for pid in bsplines[cid] if pid in points]
+                            pts = cps if forward else list(reversed(cps))
+
+            # 3. General multi-edge loop
+            if not pts:
+                for oe in loop_edges:
+                    if oe not in oriented_edges:
+                        continue
+                    ec, forward = oriented_edges[oe]
+                    if ec not in edge_curves:
+                        continue
+                    v1, v2, cid = edge_curves[ec]
+                    v_sel = v1 if forward else v2
+                    pt_id = vertex_points.get(v_sel)
+                    if pt_id and pt_id in points:
+                        pts.append(points[pt_id])
 
             if len(pts) >= 3:
-                face_polygons[fid] = pts
+                face_polygons[fid] = [pts]
 
         # 8. Representations to items/shells/faces
         rep_to_faces: dict[int, list[int]] = {}
@@ -660,8 +883,10 @@ class Footprint3DParser:
         # If no assembly relationships, return un-instanced polygons
         if not rep_edges:
             single_polys: list[tuple[list[tuple[float, float, float]], tuple[int, int, int] | None]] = []
-            for fid, pts in face_polygons.items():
-                single_polys.append((pts, face_colors.get(fid)))
+            for fid, poly_list in face_polygons.items():
+                col = face_colors.get(fid)
+                for pts in poly_list:
+                    single_polys.append((pts, col))
             return 1.0, single_polys
 
         # Find assembly root representation
@@ -698,10 +923,12 @@ class Footprint3DParser:
             for fid in fids:
                 if fid not in face_polygons:
                     continue
-                pts = face_polygons[fid]
-                for tid in t_list:
-                    pts = [apply_transform(p, tid) for p in pts]
-                assembled_polys.append((pts, face_colors.get(fid)))
+                col = face_colors.get(fid)
+                for orig_pts in face_polygons[fid]:
+                    pts = orig_pts
+                    for tid in t_list:
+                        pts = [apply_transform(p, tid) for p in pts]
+                    assembled_polys.append((pts, col))
 
         return 1.0, assembled_polys
 
