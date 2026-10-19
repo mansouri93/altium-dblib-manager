@@ -17,9 +17,13 @@ hiddenimports = [
     'PySide6.QtWidgets',
     'PySide6.QtSvg',
     'PySide6.QtSvgWidgets',
+    'PySide6.QtOpenGL',
+    'PySide6.QtOpenGLWidgets',
     'olefile',
     'svgwrite',
     'pyaltiumlib',
+    'cascadio',
+    'trimesh',
     'inventree_client',
 ]
 hiddenimports += collect_submodules('qtawesome')

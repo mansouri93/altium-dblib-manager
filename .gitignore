@@ -40,6 +40,7 @@ inventree-viewer-settings.json
 *.laccdb
 *.ldb
 *.bak
+tests/data/*.accdb
 
 # ==========================================
 # Altium Designer Temporary & Backup Files

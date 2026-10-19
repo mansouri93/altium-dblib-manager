@@ -6,6 +6,8 @@ pywin32>=306
 olefile>=0.46
 svgwrite>=1.4.3
 pyaltiumlib>=0.7
+cascadio>=0.0.9
+trimesh>=4.0.0
 
 # Build and Packaging (optional)
 pyinstaller>=6.0.0

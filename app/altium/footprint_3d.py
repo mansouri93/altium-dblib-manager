@@ -9,6 +9,12 @@ from typing import Any
 import zlib
 import olefile
 import pyaltiumlib
+try:
+    import cascadio
+    import trimesh
+except ImportError:
+    cascadio = None
+    trimesh = None
 from ..config import to_absolute_path
 
 logger = logging.getLogger(__name__)
@@ -25,6 +31,37 @@ class Pad3D:
     designator: str = ""
     is_thru_hole: bool = False
     hole_diameter: float = 0.0  # mm
+    z_top: float = 0.0          # mm (top face)
+    z_bottom: float = -0.1      # mm (extruded 0.1mm thickness downwards)
+    shape: str = "RECTANGULAR"  # RECTANGULAR, ROUND, ROUNDED_RECTANGLE, OCTAGONAL
+    corner_radius_percentage: float = 0.0
+
+
+@dataclass
+class FootprintLine3D:
+    """A 2D line segment on a PCB layer (e.g. Silkscreen, Mechanical, Copper trace)."""
+    x1: float  # mm
+    y1: float  # mm
+    x2: float  # mm
+    y2: float  # mm
+    width: float = 0.15  # mm physical stroke width
+    layer_id: int = 33   # 33: Top Overlay, 1: Top Copper, 32: Bottom Layer, 34: Bottom Overlay, 69/71: Mechanical
+    color: tuple[float, float, float] = (0.96, 0.96, 0.98)  # Normalized RGB (0.0 - 1.0)
+    z: float = 0.002     # mm height (0.002 for top, -1.002 for bottom)
+
+
+@dataclass
+class FootprintArc3D:
+    """A 2D circular arc segment on a PCB layer."""
+    cx: float  # mm center X
+    cy: float  # mm center Y
+    radius: float  # mm
+    angle_start: float  # degrees
+    angle_end: float    # degrees
+    width: float = 0.15  # mm
+    layer_id: int = 33
+    color: tuple[float, float, float] = (0.96, 0.96, 0.98)
+    z: float = 0.002     # mm height (0.002 for top, -1.002 for bottom)
 
 
 @dataclass
@@ -35,6 +72,15 @@ class Polygon3D:
     color: tuple[int, int, int]  # RGB (0-255)
     center: tuple[float, float, float] = (0.0, 0.0, 0.0)
     area: float = 0.0  # surface area in mm^2 for coplanar detail layering
+
+
+@dataclass
+class MeshBatch3D:
+    """A batch of 3D triangles sharing an RGB color for high-performance OpenGL rendering."""
+    vertices: list[float]  # Flat list of coordinates [x0, y0, z0, x1, y1, z1, ...]
+    normals: list[float]   # Flat list of normal vectors [nx0, ny0, nz0, ...]
+    color: tuple[float, float, float]  # Normalized RGB (0.0 - 1.0)
+    count: int = 0  # Number of vertices (len(vertices) // 3)
 
 
 @dataclass
@@ -67,8 +113,11 @@ class Footprint3DModel:
     bbox_max: tuple[float, float, float] = (0.0, 0.0, 0.0)
     polygons: list[Polygon3D] = field(default_factory=list)
     pads: list[Pad3D] = field(default_factory=list)
+    lines: list[FootprintLine3D] = field(default_factory=list)
+    arcs: list[FootprintArc3D] = field(default_factory=list)
     has_3d_model: bool = False
     source_step_name: str = ""
+    mesh_batches: list[MeshBatch3D] = field(default_factory=list)
 
 
 def _parse_val_with_unit(s: str) -> float:
@@ -193,16 +242,17 @@ class Footprint3DParser:
         return model
 
     def _extract_model(self, pcb_path: Path, part_name: str) -> Footprint3DModel:
-        """Parse OLE compound file and extract 3D STEP geometry and pads."""
-        # 1. Extract pads from pyaltiumlib
+        """Parse OLE compound file and extract 3D STEP geometry, pads, and layer graphics."""
+        # 1. Extract pads and 2D layer graphics (silkscreen, mechanical, traces) from pyaltiumlib
         pads = self._extract_pads(pcb_path, part_name)
+        lines, arcs = self._extract_layer_graphics(pcb_path, part_name)
 
         # 2. Check OLE compound file
         try:
             ole = olefile.OleFileIO(str(pcb_path))
         except Exception as exc:
             logger.warning(f"Failed to open OLE file {pcb_path}: {exc}")
-            return self._generate_fallback_model(part_name, pads)
+            return self._generate_fallback_model(part_name, pads, lines, arcs)
 
         try:
             # Extract all 3D bodies configured on this footprint
@@ -218,7 +268,7 @@ class Footprint3DParser:
                     bodies.append(Body3DInfo(stream_name=model_streams[0]))
                 else:
                     ole.close()
-                    return self._generate_fallback_model(part_name, pads)
+                    return self._generate_fallback_model(part_name, pads, lines, arcs)
 
             # Decompress and parse unique STEP model streams
             step_cache: dict[str, tuple[float, list[tuple[list[tuple[float, float, float]], tuple[int, int, int] | None]]]] = {}
@@ -229,25 +279,34 @@ class Footprint3DParser:
                     if ole.exists(s_parts):
                         try:
                             raw_data = ole.openstream(s_parts).read()
-                            step_text = ""
+                            decomp_bytes = b""
                             try:
-                                step_text = zlib.decompress(raw_data).decode("latin1", errors="ignore")
+                                decomp_bytes = zlib.decompress(raw_data)
                             except Exception:
-                                step_text = raw_data.decode("latin1", errors="ignore")
+                                decomp_bytes = raw_data
 
-                            if "ISO-10303-21" in step_text:
-                                unit_sc, raw_polys = self._parse_step_polygons(step_text)
-                                step_cache[s_name] = (unit_sc, raw_polys)
+                            step_bytes = decomp_bytes if b"ISO-10303-21" in decomp_bytes else (raw_data if b"ISO-10303-21" in raw_data else b"")
+                            step_text = decomp_bytes.decode("latin1", errors="ignore")
+
+                            if step_bytes or "ISO-10303-21" in step_text:
+                                raw_polys = []
+                                unit_sc = 1.0
+                                if step_bytes:
+                                    raw_polys = self._parse_step_with_cascadio(step_bytes)
+                                if not raw_polys and "ISO-10303-21" in step_text:
+                                    unit_sc, raw_polys = self._parse_step_polygons(step_text)
+                                if raw_polys:
+                                    step_cache[s_name] = (unit_sc, raw_polys)
                         except Exception as exc:
                             logger.debug(f"Error reading model stream {s_name}: {exc}")
 
             ole.close()
 
             if not step_cache:
-                return self._generate_fallback_model(part_name, pads)
+                return self._generate_fallback_model(part_name, pads, lines, arcs)
 
             # Construct transformed 3D polygon meshes across all bodies
-            model = self._build_model_from_bodies(part_name, bodies, step_cache, pads)
+            model = self._build_model_from_bodies(part_name, bodies, step_cache, pads, lines, arcs)
             return model
         except Exception as exc:
             logger.error(f"Error extracting 3D model for {part_name} in {pcb_path}: {exc}", exc_info=True)
@@ -255,7 +314,7 @@ class Footprint3DParser:
                 ole.close()
             except Exception:
                 pass
-            return self._generate_fallback_model(part_name, pads)
+            return self._generate_fallback_model(part_name, pads, lines, arcs)
 
     def _extract_pads(self, pcb_path: Path, part_name: str) -> list[Pad3D]:
         """Extract copper pads from footprint using pyaltiumlib."""
@@ -269,12 +328,14 @@ class Footprint3DParser:
             for record in part.Records:
                 if "PcbPad" in str(type(record)):
                     loc = getattr(record, "location", None)
+                    # Note: pyaltiumlib's read_bin_coord defaults to scaley=-1.0 (for 2D SVG rendering),
+                    # so we invert Y to restore Altium's true native Cartesian +Y coordinate.
                     if hasattr(loc, "x") and hasattr(loc, "y"):
                         lx_mm = float(loc.x) * 0.0254
-                        ly_mm = float(loc.y) * 0.0254
+                        ly_mm = -float(loc.y) * 0.0254
                     elif isinstance(loc, (list, tuple)) and len(loc) >= 2:
                         lx_mm = float(loc[0]) * 0.0254
-                        ly_mm = float(loc[1]) * 0.0254
+                        ly_mm = -float(loc[1]) * 0.0254
                     else:
                         lx_mm, ly_mm = 0.0, 0.0
 
@@ -294,6 +355,55 @@ class Footprint3DParser:
                     hole_dia_mm = hole_sz_mil * 0.0254
                     is_thru = hole_dia_mm > 0.05
 
+                    # Shape extraction
+                    shape_val = getattr(record, "shape_top", None)
+                    shape_int = None
+                    if hasattr(shape_val, "to_int"):
+                        try:
+                            shape_int = shape_val.to_int()
+                        except Exception:
+                            shape_int = None
+                    elif isinstance(shape_val, int):
+                        shape_int = shape_val
+                    elif shape_val is not None:
+                        s_str = str(shape_val).strip().lower()
+                        if "round" in s_str and "rect" not in s_str:
+                            shape_int = 1
+                        elif "rect" in s_str and "round" not in s_str:
+                            shape_int = 2
+                        elif "oct" in s_str:
+                            shape_int = 3
+                        elif "round" in s_str and "rect" in s_str:
+                            shape_int = 9
+
+                    if shape_int == 1:
+                        pad_shape = "ROUND"
+                    elif shape_int == 3:
+                        pad_shape = "OCTAGONAL"
+                    elif shape_int == 9:
+                        pad_shape = "ROUNDED_RECTANGLE"
+                    else:
+                        pad_shape = "RECTANGULAR"
+
+                    crp_raw = getattr(record, "corner_radius_percentage", None)
+                    cr_pct = 0.0
+                    if crp_raw is not None:
+                        if isinstance(crp_raw, (list, tuple)) and len(crp_raw) > 0:
+                            try:
+                                cr_pct = float(crp_raw[0] or 0.0)
+                            except Exception:
+                                cr_pct = 0.0
+                        else:
+                            try:
+                                cr_pct = float(crp_raw or 0.0)
+                            except Exception:
+                                cr_pct = 0.0
+
+                    if pad_shape == "ROUND":
+                        cr_pct = 100.0
+                    elif pad_shape == "ROUNDED_RECTANGLE" and cr_pct <= 0.0:
+                        cr_pct = 25.0
+
                     pads.append(
                         Pad3D(
                             x=round(lx_mm, 4),
@@ -304,11 +414,123 @@ class Footprint3DParser:
                             designator=des,
                             is_thru_hole=is_thru,
                             hole_diameter=round(hole_dia_mm, 4),
+                            shape=pad_shape,
+                            corner_radius_percentage=round(cr_pct, 2),
                         )
                     )
         except Exception as exc:
             logger.debug(f"Error extracting pads for {part_name}: {exc}")
         return pads
+
+    def _extract_layer_graphics(
+        self, pcb_path: Path, part_name: str
+    ) -> tuple[list[FootprintLine3D], list[FootprintArc3D]]:
+        """
+        Extract 2D vector elements (tracks, arcs, regions) across all footprint layers:
+        - Layer 33 (Top Overlay / Silkscreen): White #f5f5f8
+        - Layer 1 / 74 (Top Copper / Multi-Layer): Copper #da873c
+        - Mechanical layers (57, 69, 71, etc.): Courtyard / Assembly cyan #4ecdc4
+        All coordinates have Y negated to match Altium's native Cartesian +Y space.
+        """
+        lines: list[FootprintLine3D] = []
+        arcs: list[FootprintArc3D] = []
+        try:
+            lib = pyaltiumlib.read(str(pcb_path))
+            part = lib.get_part(part_name)
+            if not part or not hasattr(part, "Records"):
+                return lines, arcs
+
+            for record in part.Records:
+                lyr = int(getattr(record, "layer", 33) or 33)
+                rec_type = type(record).__name__
+
+                # Skip component bodies or non-primitive records
+                if "ComponentBody" in rec_type:
+                    continue
+
+                # Color and Z-height classification by PCB layer
+                if lyr == 33:
+                    # Top Overlay (Silkscreen): crisp white
+                    col = (0.96, 0.96, 0.98)
+                    z = 0.002
+                elif lyr in (1, 74):
+                    # Top Copper / Multi-layer: metallic copper
+                    col = (0.85, 0.48, 0.22)
+                    z = 0.002
+                elif lyr == 32:
+                    # Bottom Layer (Bottom Copper): electric blue at distance -1 mm from board surface
+                    col = (0.18, 0.47, 0.82)
+                    z = -1.002
+                elif lyr == 34:
+                    # Bottom Overlay (Bottom Silkscreen): pale cream / tan at distance -1 mm from board surface
+                    col = (0.88, 0.85, 0.62)
+                    z = -1.002
+                else:
+                    # Mechanical / Courtyard: subtle cyan / teal
+                    col = (0.31, 0.80, 0.77)
+                    z = 0.002
+
+                if "Track" in rec_type:
+                    st = getattr(record, "start", None)
+                    en = getattr(record, "end", None)
+                    lw_val = float(getattr(record, "linewidth", 6.0) or 6.0) * 0.0254
+                    lw = max(0.05, lw_val)
+                    if hasattr(st, "x") and hasattr(en, "x"):
+                        lines.append(
+                            FootprintLine3D(
+                                x1=round(float(st.x) * 0.0254, 4),
+                                y1=round(-float(st.y) * 0.0254, 4),
+                                x2=round(float(en.x) * 0.0254, 4),
+                                y2=round(-float(en.y) * 0.0254, 4),
+                                width=round(lw, 4),
+                                layer_id=lyr,
+                                color=col,
+                                z=z,
+                            )
+                        )
+                elif "Arc" in rec_type:
+                    loc = getattr(record, "location", None)
+                    rad_val = float(getattr(record, "radius", 10.0) or 10.0) * 0.0254
+                    a_start = float(getattr(record, "angle_start", 0.0) or 0.0)
+                    a_end = float(getattr(record, "angle_end", 360.0) or 360.0)
+                    lw_val = float(getattr(record, "linewidth", 6.0) or 6.0) * 0.0254
+                    lw = max(0.05, lw_val)
+                    if hasattr(loc, "x") and hasattr(loc, "y"):
+                        arcs.append(
+                            FootprintArc3D(
+                                cx=round(float(loc.x) * 0.0254, 4),
+                                cy=round(-float(loc.y) * 0.0254, 4),
+                                radius=round(rad_val, 4),
+                                angle_start=a_start,
+                                angle_end=a_end,
+                                width=round(lw, 4),
+                                layer_id=lyr,
+                                color=col,
+                                z=z,
+                            )
+                        )
+                elif "Region" in rec_type:
+                    verts = getattr(record, "vertices", [])
+                    if verts and len(verts) >= 3:
+                        pts = [(float(v.x) * 0.0254, -float(v.y) * 0.0254) for v in verts]
+                        for i in range(len(pts)):
+                            p_curr = pts[i]
+                            p_next = pts[(i + 1) % len(pts)]
+                            lines.append(
+                                FootprintLine3D(
+                                    x1=round(p_curr[0], 4),
+                                    y1=round(p_curr[1], 4),
+                                    x2=round(p_next[0], 4),
+                                    y2=round(p_next[1], 4),
+                                    width=0.15,
+                                    layer_id=lyr,
+                                    color=col,
+                                    z=z,
+                                )
+                            )
+        except Exception as exc:
+            logger.debug(f"Error extracting layer graphics for {part_name}: {exc}")
+        return lines, arcs
 
     def _extract_all_bodies(self, ole: olefile.OleFileIO, part_name: str) -> list[Body3DInfo]:
         """
@@ -378,6 +600,11 @@ class Footprint3DParser:
                 m_h = re.search(r"OVERALLHEIGHT=([^\s|]+)", chunk)
                 m_c = re.search(r"BODYCOLOR3D=([^\s|]+)", chunk)
 
+                rot_x = float(m_rx.group(1)) if m_rx else 0.0
+                rot_y = float(m_ry.group(1)) if m_ry else 0.0
+                rot_z = float(m_rz.group(1)) if m_rz else 0.0
+                rot_2d = float(m_2dr.group(1)) if m_2dr else 0.0
+
                 stream_name = model_id_to_stream.get(model_id.upper())
                 if not stream_name:
                     for s in ole.listdir():
@@ -403,10 +630,10 @@ class Footprint3DParser:
                         stream_name=stream_name or "Library/Models/0",
                         x_2d=_parse_val_with_unit(m_2dx.group(1)) if m_2dx else 0.0,
                         y_2d=_parse_val_with_unit(m_2dy.group(1)) if m_2dy else 0.0,
-                        rot_2d=float(m_2dr.group(1)) if m_2dr else 0.0,
-                        rot_x=float(m_rx.group(1)) if m_rx else 0.0,
-                        rot_y=float(m_ry.group(1)) if m_ry else 0.0,
-                        rot_z=float(m_rz.group(1)) if m_rz else 0.0,
+                        rot_2d=rot_2d,
+                        rot_x=rot_x,
+                        rot_y=rot_y,
+                        rot_z=rot_z,
                         dz=_parse_val_with_unit(m_dz.group(1)) if m_dz else 0.0,
                         standoff=_parse_val_with_unit(m_st.group(1)) if m_st else 0.0,
                         overall_height=_parse_val_with_unit(m_h.group(1)) if m_h else 0.0,
@@ -416,6 +643,60 @@ class Footprint3DParser:
             idx = end + 1
 
         return bodies
+
+    def _parse_step_with_cascadio(
+        self, step_bytes: bytes
+    ) -> list[tuple[list[tuple[float, float, float]], tuple[int, int, int] | None]]:
+        """
+        Parse STEP geometry into colored triangle polygons using OpenCASCADE (cascadio + trimesh).
+        Returns list of ([p0, p1, p2], color) tuples in millimeters.
+        """
+        if cascadio is None or trimesh is None:
+            return []
+        try:
+            glb_bytes = cascadio.to_glb_bytes(
+                step_bytes,
+                tol_linear=0.02,
+                tol_angular=0.5,
+                include_materials=True,
+            )
+            if not glb_bytes:
+                return []
+
+            scene = trimesh.load(trimesh.util.wrap_as_stream(glb_bytes), file_type="glb")
+            dumped_meshes = scene.dump()
+            polygons: list[tuple[list[tuple[float, float, float]], tuple[int, int, int] | None]] = []
+
+            for mesh in dumped_meshes:
+                if not len(mesh.faces):
+                    continue
+
+                poly_col: tuple[int, int, int] | None = None
+                if hasattr(mesh.visual, "material") and mesh.visual.material:
+                    base_color = getattr(mesh.visual.material, "baseColorFactor", None)
+                    if base_color is not None and len(base_color) >= 3:
+                        poly_col = (int(base_color[0]), int(base_color[1]), int(base_color[2]))
+                    else:
+                        mc = getattr(mesh.visual.material, "main_color", None)
+                        if mc is not None and len(mc) >= 3:
+                            poly_col = (int(mc[0]), int(mc[1]), int(mc[2]))
+                if poly_col is None and hasattr(mesh.visual, "main_color"):
+                    mc = mesh.visual.main_color
+                    if mc is not None and len(mc) >= 3:
+                        poly_col = (int(mc[0]), int(mc[1]), int(mc[2]))
+
+                verts_mm = mesh.vertices * 1000.0
+
+                for face in mesh.faces:
+                    p0 = (float(verts_mm[face[0]][0]), float(verts_mm[face[0]][1]), float(verts_mm[face[0]][2]))
+                    p1 = (float(verts_mm[face[1]][0]), float(verts_mm[face[1]][1]), float(verts_mm[face[1]][2]))
+                    p2 = (float(verts_mm[face[2]][0]), float(verts_mm[face[2]][1]), float(verts_mm[face[2]][2]))
+                    polygons.append(([p0, p1, p2], poly_col))
+
+            return polygons
+        except Exception as exc:
+            logger.debug(f"cascadio STEP parse error: {exc}")
+            return []
 
     def _parse_step_polygons(
         self, step_text: str
@@ -938,6 +1219,8 @@ class Footprint3DParser:
         bodies: list[Body3DInfo],
         step_cache: dict[str, tuple[float, list[tuple[list[tuple[float, float, float]], tuple[int, int, int] | None]]]],
         pads: list[Pad3D],
+        lines: list[FootprintLine3D] | None = None,
+        arcs: list[FootprintArc3D] | None = None,
     ) -> Footprint3DModel:
         """Transforms all 3D bodies into the footprint coordinate frame and constructs Footprint3DModel."""
         final_polygons: list[Polygon3D] = []
@@ -1027,6 +1310,39 @@ class Footprint3DParser:
         # Standoff above PCB surface
         standoff_mm = primary_body.standoff if primary_body.standoff != 0.0 else max(0.0, min_z)
 
+        # Construct optimized mesh batches grouped by RGB color for OpenGL rendering
+        batches_by_color: dict[tuple[int, int, int], tuple[list[float], list[float]]] = {}
+        for poly in final_polygons:
+            c_key = poly.color
+            if c_key not in batches_by_color:
+                batches_by_color[c_key] = ([], [])
+            v_list, n_list = batches_by_color[c_key]
+            if len(poly.points) == 3:
+                for p in poly.points:
+                    v_list.extend(p)
+                    n_list.extend(poly.normal)
+            elif len(poly.points) > 3:
+                p0 = poly.points[0]
+                for i in range(1, len(poly.points) - 1):
+                    p1 = poly.points[i]
+                    p2 = poly.points[i + 1]
+                    v_list.extend(p0)
+                    v_list.extend(p1)
+                    v_list.extend(p2)
+                    n_list.extend(poly.normal)
+                    n_list.extend(poly.normal)
+                    n_list.extend(poly.normal)
+
+        mesh_batches = [
+            MeshBatch3D(
+                vertices=v,
+                normals=n,
+                color=(c[0] / 255.0, c[1] / 255.0, c[2] / 255.0),
+                count=len(v) // 3,
+            )
+            for c, (v, n) in batches_by_color.items()
+        ]
+
         return Footprint3DModel(
             name=part_name,
             length_mm=len_x,
@@ -1037,11 +1353,20 @@ class Footprint3DParser:
             bbox_max=(max_x, max_y, max_z),
             polygons=final_polygons,
             pads=pads,
+            lines=lines or [],
+            arcs=arcs or [],
             has_3d_model=True,
             source_step_name=primary_body.name,
+            mesh_batches=mesh_batches,
         )
 
-    def _generate_fallback_model(self, part_name: str, pads: list[Pad3D]) -> Footprint3DModel:
+    def _generate_fallback_model(
+        self,
+        part_name: str,
+        pads: list[Pad3D],
+        lines: list[FootprintLine3D] | None = None,
+        arcs: list[FootprintArc3D] | None = None,
+    ) -> Footprint3DModel:
         """Synthesize a clean 3D component model centered on pads when no embedded STEP model is present."""
         if pads:
             xs = [p.x for p in pads]
@@ -1094,6 +1419,23 @@ class Footprint3DParser:
             for pts, norm, col in box_faces
         ]
 
+        mesh_batches: list[MeshBatch3D] = []
+        for pts, norm, col in box_faces:
+            # Triangulate quad
+            v_flat = []
+            n_flat = []
+            for idx in [0, 1, 2, 0, 2, 3]:
+                v_flat.extend(pts[idx])
+                n_flat.extend(norm)
+            mesh_batches.append(
+                MeshBatch3D(
+                    vertices=v_flat,
+                    normals=n_flat,
+                    color=(col[0] / 255.0, col[1] / 255.0, col[2] / 255.0),
+                    count=6,
+                )
+            )
+
         return Footprint3DModel(
             name=part_name,
             length_mm=round(len_x, 3),
@@ -1104,5 +1446,8 @@ class Footprint3DParser:
             bbox_max=(pad_cx + hx, pad_cy + hy, len_z),
             polygons=polygons,
             pads=pads,
+            lines=lines or [],
+            arcs=arcs or [],
             has_3d_model=False,
+            mesh_batches=mesh_batches,
         )
