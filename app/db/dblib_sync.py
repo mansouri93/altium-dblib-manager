@@ -91,11 +91,24 @@ class DbLibSync:
             ("IPN", 1),
         ]
 
+        # Altium model reference fields that require square brackets
+        model_reserved_fields = {
+            "Library Ref", "Library Path",
+            "Footprint Ref", "Footprint Path",
+            "Footprint Ref 2", "Footprint Path 2",
+            "Footprint Ref 3", "Footprint Path 3",
+            "Description",
+        }
+
         curr_field_idx = highest_field_idx
         for field_name, ftype in standard_fields:
             if field_name in columns or not columns:
                 curr_field_idx += 1
-                param_name = field_name if ftype == 0 else f"[{field_name}]"
+                if field_name in model_reserved_fields:
+                    param_name = f"[{field_name}]"
+                else:
+                    param_name = field_name
+                visible = "True" if field_name == "Value" else "False"
                 new_lines.append(f"[FieldMap{curr_field_idx}]")
                 opt = (
                     f"Options=FieldName={table_name}.{field_name}|"
@@ -103,7 +116,7 @@ class DbLibSync:
                     f"FieldNameOnly={field_name}|"
                     f"FieldType={ftype}|"
                     f"ParameterName={param_name}|"
-                    f"VisibleOnAdd=False|AddMode=0|RemoveMode=0|UpdateMode=0"
+                    f"VisibleOnAdd={visible}|AddMode=0|RemoveMode=0|UpdateMode=0"
                 )
                 new_lines.append(opt)
 
