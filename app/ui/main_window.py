@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QHeaderView,
     QGroupBox,
+    QComboBox,
     QProgressDialog,
     QMenu,
     QButtonGroup,
@@ -46,6 +47,7 @@ from ..config import (
 from ..db.access_manager import AccessDBManager, check_access_driver_installed
 from ..db.dblib_sync import DbLibSync
 from ..altium.preview_cache import PreviewCache
+from ..altium.parser import part_id_to_name
 from ..altium.unit_engine import EngineeringValueParser, ColumnUnitConfigManager
 from ..inventree.client import InvenTreeClient, ComponentLinkManager, TableCategoryManager
 from .table_view import ComponentsTableModel, TableItemDelegate, AltiumFilterProxyModel
@@ -551,6 +553,51 @@ class MainWindow(QMainWindow):
         # 1. Symbol Preview Card
         sym_box = QGroupBox("Schematic Symbol Preview", self)
         sym_box_layout = QVBoxLayout(sym_box)
+
+        # Sub-part selector bar (visible only when component has multiple parts)
+        self.sym_part_bar = QWidget(self)
+        sym_part_layout = QHBoxLayout(self.sym_part_bar)
+        sym_part_layout.setContentsMargins(0, 0, 0, 2)
+        sym_part_layout.setSpacing(6)
+
+        lbl_sym_part = QLabel("Sub-part:", self.sym_part_bar)
+        lbl_sym_part.setStyleSheet("color: #a0a0c0; font-size: 11px; font-weight: bold;")
+        sym_part_layout.addWidget(lbl_sym_part)
+
+        self.combo_sym_parts = QComboBox(self.sym_part_bar)
+        self.combo_sym_parts.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.combo_sym_parts.setStyleSheet("""
+            QComboBox {
+                background-color: #212130;
+                color: #e0e0ff;
+                border: 1px solid #33334d;
+                border-radius: 4px;
+                padding: 3px 8px;
+                font-size: 11px;
+                font-weight: 500;
+                min-width: 90px;
+            }
+            QComboBox:hover {
+                background-color: #2a2a3e;
+                border-color: #4a4a6e;
+            }
+            QComboBox::drop-down {
+                border: none;
+                width: 16px;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #1e1e28;
+                color: #e0e0ff;
+                selection-background-color: #007acc;
+                border: 1px solid #33334d;
+            }
+        """)
+        self.combo_sym_parts.currentIndexChanged.connect(self._on_sym_part_changed)
+        sym_part_layout.addWidget(self.combo_sym_parts)
+        sym_part_layout.addStretch()
+        self.sym_part_bar.setVisible(False)
+        sym_box_layout.addWidget(self.sym_part_bar)
+
         self.symbol_viewer = SvgViewer("Symbol", self)
         self.symbol_viewer.setMinimumHeight(280)
         sym_box_layout.addWidget(self.symbol_viewer)
@@ -980,14 +1027,9 @@ class MainWindow(QMainWindow):
             # 1. Update Symbol Preview
             sym_path = rec.get("Library Path") or ""
             sym_ref = rec.get("Library Ref") or ""
-            if sym_path and sym_ref:
-                self.lbl_sym_path.setText(f"Ref: {sym_ref}\nFile: {Path(sym_path).name}")
-                logger.debug(f"Loading symbol preview for {sym_ref} from {sym_path}")
-                svg_str = self.preview_cache.get_svg(sym_path, sym_ref)
-                self.symbol_viewer.load_svg(svg_str, sym_ref)
-            else:
-                self.lbl_sym_path.setText("Ref: Not assigned")
-                self.symbol_viewer.show_placeholder("No symbol assigned")
+            self._current_sym_path = sym_path
+            self._current_sym_ref = sym_ref
+            self._update_symbol_preview(reload_parts=True)
 
             # 2. Update Footprint Slot Indicators and Active Preview
             fp1_ref = rec.get("Footprint Ref")
@@ -1059,6 +1101,48 @@ class MainWindow(QMainWindow):
             return "Footprint Ref 3", "Footprint Path 3"
         return "Footprint Ref", "Footprint Path"
 
+    def _on_sym_part_changed(self) -> None:
+        """Handle user changing the active sub-part in the combo box."""
+        if not getattr(self, "_current_sym_path", "") or not getattr(self, "_current_sym_ref", ""):
+            return
+        self._update_symbol_preview(reload_parts=False)
+
+    def _update_symbol_preview(self, reload_parts: bool = True) -> None:
+        """Update schematic symbol preview according to current active sub-part."""
+        sym_path = getattr(self, "_current_sym_path", "")
+        sym_ref = getattr(self, "_current_sym_ref", "")
+
+        if not sym_path or not sym_ref:
+            self.lbl_sym_path.setText("Ref: Not assigned")
+            if hasattr(self, "sym_part_bar"):
+                self.sym_part_bar.setVisible(False)
+            self.symbol_viewer.show_placeholder("No symbol assigned")
+            return
+
+        if reload_parts and hasattr(self, "combo_sym_parts"):
+            subpart_count = self.preview_cache.get_subpart_count(sym_path, sym_ref)
+            self.combo_sym_parts.blockSignals(True)
+            self.combo_sym_parts.clear()
+            if subpart_count > 1:
+                for i in range(1, subpart_count + 1):
+                    self.combo_sym_parts.addItem(part_id_to_name(i), i)
+                self.combo_sym_parts.setCurrentIndex(0)
+                self.sym_part_bar.setVisible(True)
+            else:
+                self.sym_part_bar.setVisible(False)
+            self.combo_sym_parts.blockSignals(False)
+
+        subpart_id = 1
+        part_tag = ""
+        if hasattr(self, "sym_part_bar") and self.sym_part_bar.isVisible() and hasattr(self, "combo_sym_parts"):
+            subpart_id = self.combo_sym_parts.currentData() or 1
+            part_tag = f" [{part_id_to_name(subpart_id)}]"
+
+        self.lbl_sym_path.setText(f"Ref: {sym_ref}{part_tag}\nFile: {Path(sym_path).name}")
+        logger.debug(f"Loading symbol preview for {sym_ref} (subpart {subpart_id}) from {sym_path}")
+        svg_str = self.preview_cache.get_svg(sym_path, sym_ref, subpart_id=subpart_id)
+        self.symbol_viewer.load_svg(svg_str, f"{sym_ref}{part_tag}")
+
     def _on_fp_slot_changed(self, slot_id: int) -> None:
         self.active_fp_slot = slot_id
         self._update_active_footprint_preview()
@@ -1102,6 +1186,10 @@ class MainWindow(QMainWindow):
                 self.fp_clear_btn.setEnabled(False)
 
     def _clear_previews(self) -> None:
+        self._current_sym_path = ""
+        self._current_sym_ref = ""
+        if hasattr(self, "sym_part_bar"):
+            self.sym_part_bar.setVisible(False)
         self.symbol_viewer.show_placeholder("Select a component")
         self.lbl_sym_path.setText("Ref: None")
         self.footprint_viewer.show_placeholder("Select a component")

@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QTabWidget,
     QStackedWidget,
+    QComboBox,
 )
 from ..config import (
     SYMBOLS_DIR,
@@ -31,7 +32,7 @@ from ..config import (
     to_relative_path,
     to_absolute_path,
 )
-from ..altium.parser import AltiumParser
+from ..altium.parser import AltiumParser, part_id_to_name
 from ..altium.preview_cache import PreviewCache
 from ..altium.library_history import LibraryHistoryManager
 from .svg_viewer import SvgViewer
@@ -318,6 +319,50 @@ class LibraryBrowserDialog(QDialog):
         if self.mode in ("FOOTPRINT", "footprint"):
             self.svg_viewer = FootprintPreviewWidget(f"{self.mode.title()} Preview", self)
         else:
+            # Sub-part selector bar (visible only when symbol has multiple parts)
+            self.sym_part_bar = QWidget(self)
+            sym_part_layout = QHBoxLayout(self.sym_part_bar)
+            sym_part_layout.setContentsMargins(2, 0, 2, 2)
+            sym_part_layout.setSpacing(6)
+
+            lbl_sym_part = QLabel("Sub-part:", self.sym_part_bar)
+            lbl_sym_part.setStyleSheet("color: #a0a0c0; font-size: 11px; font-weight: bold;")
+            sym_part_layout.addWidget(lbl_sym_part)
+
+            self.combo_sym_parts = QComboBox(self.sym_part_bar)
+            self.combo_sym_parts.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.combo_sym_parts.setStyleSheet("""
+                QComboBox {
+                    background-color: #212130;
+                    color: #e0e0ff;
+                    border: 1px solid #33334d;
+                    border-radius: 4px;
+                    padding: 3px 8px;
+                    font-size: 11px;
+                    font-weight: 500;
+                    min-width: 90px;
+                }
+                QComboBox:hover {
+                    background-color: #2a2a3e;
+                    border-color: #4a4a6e;
+                }
+                QComboBox::drop-down {
+                    border: none;
+                    width: 16px;
+                }
+                QComboBox QAbstractItemView {
+                    background-color: #1e1e28;
+                    color: #e0e0ff;
+                    selection-background-color: #007acc;
+                    border: 1px solid #33334d;
+                }
+            """)
+            self.combo_sym_parts.currentIndexChanged.connect(self._on_sym_part_changed)
+            sym_part_layout.addWidget(self.combo_sym_parts)
+            sym_part_layout.addStretch()
+            self.sym_part_bar.setVisible(False)
+            preview_layout.addWidget(self.sym_part_bar)
+
             self.svg_viewer = SvgViewer(f"{self.mode.title()} Preview", self)
         preview_layout.addWidget(self.svg_viewer)
 
@@ -501,6 +546,8 @@ class LibraryBrowserDialog(QDialog):
             self.lbl_selection.setText("Selected: None")
             self.lbl_part_info.setText(f"File: {to_relative_path(self.selected_file_path)}\nNo parts found")
             self.btn_select.setEnabled(False)
+            if hasattr(self, "sym_part_bar"):
+                self.sym_part_bar.setVisible(False)
             self.svg_viewer.show_placeholder("No parts found in library file")
 
     def _on_file_selected(self, index: QModelIndex) -> None:
@@ -579,11 +626,7 @@ class LibraryBrowserDialog(QDialog):
         self.btn_select.setEnabled(True)
 
         # Render preview
-        svg_str = self.cache.get_svg(self.selected_file_path, part_name, width=500, height=500)
-        if hasattr(self.svg_viewer, "load_footprint"):
-            self.svg_viewer.load_footprint(self.selected_file_path, part_name, svg_str, title=part_name)
-        else:
-            self.svg_viewer.load_svg(svg_str, part_name)
+        self._render_active_preview(reload_parts=True)
 
     def _on_part_double_clicked(self, item: QListWidgetItem) -> None:
         self._on_part_clicked(item)
@@ -607,11 +650,7 @@ class LibraryBrowserDialog(QDialog):
 
         # Render preview
         if abs_p and abs_p.exists():
-            svg_str = self.cache.get_svg(str(abs_p), part_name, width=500, height=500)
-            if hasattr(self.svg_viewer, "load_footprint"):
-                self.svg_viewer.load_footprint(str(abs_p), part_name, svg_str, title=part_name)
-            else:
-                self.svg_viewer.load_svg(svg_str, part_name)
+            self._render_active_preview(reload_parts=True)
 
             # Highlight in tree view
             idx = self.fs_model.index(str(abs_p))
@@ -626,7 +665,57 @@ class LibraryBrowserDialog(QDialog):
                 if sel_m:
                     sel_m.blockSignals(False)
         else:
+            if hasattr(self, "sym_part_bar"):
+                self.sym_part_bar.setVisible(False)
             self.svg_viewer.show_placeholder(f"File not found:\n{rel_path}")
+
+    def _on_sym_part_changed(self) -> None:
+        """Handle user changing active sub-part in Library Browser."""
+        if not self.selected_file_path or not self.selected_part_name:
+            return
+        if not hasattr(self, "sym_part_bar") or not self.sym_part_bar.isVisible():
+            return
+        self._render_active_preview(reload_parts=False)
+
+    def _render_active_preview(self, reload_parts: bool = True) -> None:
+        """Render active preview with sub-part support for schematic symbols."""
+        if not self.selected_file_path or not self.selected_part_name:
+            return
+
+        abs_p = to_absolute_path(self.selected_file_path)
+        path_str = str(abs_p) if abs_p and abs_p.exists() else self.selected_file_path
+
+        if hasattr(self, "sym_part_bar") and hasattr(self, "combo_sym_parts"):
+            if reload_parts:
+                subpart_count = self.cache.get_subpart_count(path_str, self.selected_part_name)
+                self.combo_sym_parts.blockSignals(True)
+                self.combo_sym_parts.clear()
+                if subpart_count > 1:
+                    for i in range(1, subpart_count + 1):
+                        self.combo_sym_parts.addItem(part_id_to_name(i), i)
+                    self.combo_sym_parts.setCurrentIndex(0)
+                    self.sym_part_bar.setVisible(True)
+                else:
+                    self.sym_part_bar.setVisible(False)
+                self.combo_sym_parts.blockSignals(False)
+
+            subpart_id = 1
+            part_tag = ""
+            if self.sym_part_bar.isVisible():
+                subpart_id = self.combo_sym_parts.currentData() or 1
+                part_tag = f" [{part_id_to_name(subpart_id)}]"
+
+            svg_str = self.cache.get_svg(path_str, self.selected_part_name, width=500, height=500, subpart_id=subpart_id)
+            if hasattr(self.svg_viewer, "load_footprint"):
+                self.svg_viewer.load_footprint(path_str, self.selected_part_name, svg_str, title=self.selected_part_name)
+            else:
+                self.svg_viewer.load_svg(svg_str, f"{self.selected_part_name}{part_tag}")
+        else:
+            svg_str = self.cache.get_svg(path_str, self.selected_part_name, width=500, height=500)
+            if hasattr(self.svg_viewer, "load_footprint"):
+                self.svg_viewer.load_footprint(path_str, self.selected_part_name, svg_str, title=self.selected_part_name)
+            else:
+                self.svg_viewer.load_svg(svg_str, self.selected_part_name)
 
     def _on_history_item_double_clicked(self, item: QListWidgetItem) -> None:
         self._on_history_item_clicked(item)

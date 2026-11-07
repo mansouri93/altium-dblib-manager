@@ -14,15 +14,29 @@ class PreviewCache:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._memory_cache: dict[str, str] = {}
 
-    def _cache_key(self, file_path: str, part_name: str, width: int, height: int) -> str:
-        raw = f"{file_path}::{part_name}::{width}x{height}"
+    def _cache_key(self, file_path: str, part_name: str, width: int, height: int, subpart_id: int | None = None) -> str:
+        part_tag = f"::part{subpart_id}" if subpart_id is not None else ""
+        raw = f"{file_path}::{part_name}{part_tag}::{width}x{height}"
         return hashlib.md5(raw.encode("utf-8", errors="ignore")).hexdigest()
 
-    def get_svg(self, file_path: str, part_name: str, width: int = 400, height: int = 400) -> str:
+    def get_subpart_count(self, file_path: str | Path, part_name: str) -> int:
+        """Return the number of sub-parts for a schematic symbol."""
+        if not file_path or not part_name:
+            return 1
+        return self.parser.get_subpart_count(file_path, part_name)
+
+    def get_svg(
+        self,
+        file_path: str,
+        part_name: str,
+        width: int = 400,
+        height: int = 400,
+        subpart_id: int | None = None,
+    ) -> str:
         if not file_path or not part_name:
             return ""
 
-        key = self._cache_key(file_path, part_name, width, height)
+        key = self._cache_key(file_path, part_name, width, height, subpart_id)
 
         # Check memory cache
         if key in self._memory_cache:
@@ -46,7 +60,7 @@ class PreviewCache:
                 pass
 
         # Generate fresh SVG
-        svg_data = self.parser.render_svg(file_path, part_name, width, height)
+        svg_data = self.parser.render_svg(file_path, part_name, width, height, subpart_id=subpart_id)
 
         # Store in caches only if valid rendering (not a placeholder error)
         if svg_data and "Render error" not in svg_data:
