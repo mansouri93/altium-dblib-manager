@@ -1,5 +1,6 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 from __future__ import annotations
+import html
 import logging
 from pathlib import Path
 from typing import Any
@@ -11,10 +12,11 @@ logger = logging.getLogger(__name__)
 
 def get_placeholder_svg(message: str, width: int = 400, height: int = 400) -> str:
     """Generate a clean placeholder SVG when preview cannot be rendered."""
+    escaped_msg = html.escape(str(message))
     return f"""<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">
   <rect width="100%" height="100%" fill="#1e1e24" rx="8"/>
   <text x="50%" y="50%" fill="#888899" font-family="Segoe UI, sans-serif" font-size="14" text-anchor="middle" dominant-baseline="middle">
-    {message}
+    {escaped_msg}
   </text>
 </svg>"""
 
@@ -65,6 +67,12 @@ class AltiumParser:
             part = lib.get_part(part_name)
             if not part:
                 return get_placeholder_svg(f"Part '{part_name}' not found in library", width, height)
+
+            # Sanitize negative rotation angles on records to prevent pyaltiumlib rotate(--...) syntax error
+            if hasattr(part, "Records"):
+                for obj in part.Records:
+                    if hasattr(obj, "rotation") and isinstance(obj.rotation, (int, float)) and obj.rotation < 0:
+                        obj.rotation = obj.rotation % 360.0
 
             dwg = svgwrite.Drawing(size=(width, height))
             part.draw_svg(dwg, width, height)

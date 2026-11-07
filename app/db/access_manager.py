@@ -614,6 +614,23 @@ class AccessDBManager:
         if col_name.upper() == "PART NUMBER":
             raise ValueError("The 'Part Number' column is mandatory and cannot be deleted.")
 
+        existing_cols = [c.lower() for c in self.get_columns(table_name)]
+        if col_name.lower() not in existing_cols:
+            raise ValueError(f"Column '{col_name}' does not exist in table '{table_name}'.")
+
+        # Check if any calculated column in this table references col_name
+        schema = self.get_table_schema(table_name)
+        for f in schema:
+            expr = f.get("expression") or ""
+            if expr:
+                import re
+                pattern = rf"(\[{re.escape(col_name)}\]|\b{re.escape(col_name)}\b)"
+                if re.search(pattern, expr, re.IGNORECASE):
+                    raise ValueError(
+                        f"Cannot delete column '{col_name}' because it is used in the calculated formula of '{f['name']}':\n"
+                        f"'{expr}'\n\nPlease edit or remove the formula before deleting this column."
+                    )
+
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(f"ALTER TABLE [{table_name}] DROP COLUMN [{col_name}]")
@@ -621,6 +638,58 @@ class AccessDBManager:
             self.invalidate_caches(table_name)
         logger.info(f"Deleted column [{col_name}] from [{table_name}]")
         return True
+
+    @staticmethod
+    def _update_dependent_calculated_formulas(tbl: Any, old_name: str, new_name: str) -> list[str]:
+        """
+        Scan all fields in a TableDef and update any calculated expressions
+        that reference [old_name] to reference [new_name].
+        """
+        import re
+        calc_fields_to_update = []
+        for f in tbl.Fields:
+            if f.Name.lower() == new_name.lower():
+                continue
+            expr = ""
+            try:
+                expr = str(f.Expression or "")
+            except Exception:
+                try:
+                    expr = str(f.Properties("Expression").Value or "")
+                except Exception:
+                    pass
+
+            if not expr:
+                continue
+
+            pattern_bracket = rf"\[{re.escape(old_name)}\]"
+            pattern_word = rf"\b{re.escape(old_name)}\b"
+            if re.search(pattern_bracket, expr, re.IGNORECASE) or re.search(pattern_word, expr, re.IGNORECASE):
+                updated_expr = re.sub(pattern_bracket, f"[{new_name}]", expr, flags=re.IGNORECASE)
+                updated_expr = re.sub(pattern_word, f"[{new_name}]", updated_expr, flags=re.IGNORECASE)
+                calc_fields_to_update.append((f.Name, f.Type, f.Size, expr, updated_expr))
+
+        updated_names = []
+        for fname, ftype, fsize, old_expr, new_expr in calc_fields_to_update:
+            logger.info(f"Auto-updating formula for [{fname}] from '{old_expr}' to '{new_expr}'")
+            tbl.Fields.Delete(fname)
+            try:
+                new_fld = tbl.CreateField(fname, ftype, fsize)
+                new_fld.Expression = new_expr
+                tbl.Fields.Append(new_fld)
+                updated_names.append(fname)
+            except Exception as exc:
+                logger.error(f"Failed to auto-update formula for [{fname}]: {exc}. Rolling back...")
+                try:
+                    rb_fld = tbl.CreateField(fname, ftype, fsize)
+                    rb_fld.Expression = old_expr
+                    tbl.Fields.Append(rb_fld)
+                except Exception:
+                    pass
+                raise ValueError(
+                    f"Renaming column '{old_name}' to '{new_name}' caused dependent formula in '{fname}' to fail: {exc}"
+                )
+        return updated_names
 
     def edit_column(
         self,
@@ -634,6 +703,7 @@ class AccessDBManager:
         Edit a column in a table (rename, change type, or update calculated formula).
         - ID cannot be modified.
         - Part Number cannot be renamed, but its type/formula can be edited.
+        - When renaming a column, all dependent calculated formulas referencing it are automatically updated.
         """
         old_name = old_name.strip()
         new_name = new_name.strip()
@@ -655,6 +725,8 @@ class AccessDBManager:
             with self._get_dao_db() as db:
                 tbl = db.TableDefs(table_name)
                 tbl.Fields(old_name).Name = new_name
+                # Auto-update any dependent calculated formulas referencing old_name
+                self._update_dependent_calculated_formulas(tbl, old_name, new_name)
             logger.info(f"Renamed column [{old_name}] -> [{new_name}] in [{table_name}]")
 
         current_name = new_name
@@ -721,6 +793,7 @@ class AccessDBManager:
 
             logger.info(f"Updated column [{current_name}] type to {new_type} in [{table_name}]")
 
+        self.invalidate_caches(table_name)
         return True
 
     def rename_table(self, old_name: str, new_name: str) -> bool:

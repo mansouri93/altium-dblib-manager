@@ -216,6 +216,7 @@ class Footprint3DViewer(QOpenGLWidget):
 
         self.model: Footprint3DModel | None = None
         self.placeholder_text: str = "Select a footprint to preview in 3D"
+        self._is_loading: bool = False
 
         # Camera state
         self.yaw: float = 45.0      # degrees around Z
@@ -324,45 +325,25 @@ class Footprint3DViewer(QOpenGLWidget):
     # -------------------------------------------------------------------------
 
     def set_model(self, model: Footprint3DModel | None) -> None:
-        """Load and display a 3D footprint model with pre-grouped coplanar surfaces."""
+        """Load and display a 3D footprint model."""
+        self._is_loading = False
         self.model = model
         self._planar_groups = []
         if model and model.polygons:
-            # Group polygons by coplanar planes: same normal direction and plane distance
-            for poly in model.polygons:
-                pts = poly.points
-                if len(pts) < 3:
-                    continue
-                nx, ny, nz = poly.normal
-                # Plane distance from origin: d = n . p0
-                d = nx * pts[0][0] + ny * pts[0][1] + nz * pts[0][2]
-
-                placed = False
-                for g in self._planar_groups:
-                    rep = g[0]
-                    rnx, rny, rnz = rep.normal
-                    dot_n = nx * rnx + ny * rny + nz * rnz
-                    # Check if normals are parallel in the SAME direction and lie on the same plane
-                    if dot_n > 0.999:
-                        rd = rnx * rep.points[0][0] + rny * rep.points[0][1] + rnz * rep.points[0][2]
-                        if abs(d - rd) < 0.01:  # within 10 microns
-                            g.append(poly)
-                            placed = True
-                            break
-                if not placed:
-                    self._planar_groups.append([poly])
-
-            # Within each coplanar group, sort by area descending (largest base surface first)
-            for g in self._planar_groups:
-                g.sort(key=lambda p: getattr(p, "area", 0.0), reverse=True)
-
             self.fit_to_view()
         else:
             self.placeholder_text = "No 3D model available"
             self.update()
 
+    def show_loading(self, message: str = "Loading 3D model...") -> None:
+        """Set viewer state to loading with a placeholder message."""
+        self._is_loading = True
+        self.placeholder_text = message
+        self.update()
+
     def show_placeholder(self, message: str) -> None:
         """Display an empty state message."""
+        self._is_loading = False
         self.model = None
         self._planar_groups = []
         self.placeholder_text = message
@@ -986,7 +967,7 @@ void main() {
             self._gl_funcs.glClearColor(0.08, 0.09, 0.12, 1.0)
             self._gl_funcs.glClear(0x00004000 | 0x00000100)  # GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT
 
-        if not self.model or not self.model.polygons:
+        if self._is_loading or not self.model or not self.model.polygons:
             p = QPainter(self)
             p.setPen(QColor("#7e889b"))
             p.setFont(QFont("Segoe UI", 12))
@@ -1021,14 +1002,17 @@ void main() {
             for b in batches:
                 if b.count <= 0:
                     continue
-                interleaved = []
-                for i in range(b.count):
-                    interleaved.extend([b.vertices[i * 3], b.vertices[i * 3 + 1], b.vertices[i * 3 + 2]])
-                    interleaved.extend([b.normals[i * 3], b.normals[i * 3 + 1], b.normals[i * 3 + 2]])
-                arr = array.array("f", interleaved)
+                gpu_bytes = getattr(b, "_vbo_bytes", None)
+                if gpu_bytes is None:
+                    interleaved = []
+                    for i in range(b.count):
+                        interleaved.extend([b.vertices[i * 3], b.vertices[i * 3 + 1], b.vertices[i * 3 + 2]])
+                        interleaved.extend([b.normals[i * 3], b.normals[i * 3 + 1], b.normals[i * 3 + 2]])
+                    gpu_bytes = array.array("f", interleaved).tobytes()
+                    setattr(b, "_vbo_bytes", gpu_bytes)
 
                 self._vbo.bind()
-                self._vbo.allocate(arr.tobytes(), len(arr.tobytes()))
+                self._vbo.allocate(gpu_bytes, len(gpu_bytes))
                 self._gl_program.setUniformValue("u_color", QVector3D(*b.color))
                 self._gl_program.enableAttributeArray("a_pos")
                 self._gl_program.setAttributeBuffer("a_pos", 0x1406, 0, 3, stride)  # GL_FLOAT

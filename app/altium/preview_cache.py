@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 import hashlib
 from pathlib import Path
@@ -33,19 +33,27 @@ class PreviewCache:
         if disk_file.exists():
             try:
                 svg_data = disk_file.read_text(encoding="utf-8")
-                self._memory_cache[key] = svg_data
-                return svg_data
+                if "Render error" not in svg_data:
+                    self._memory_cache[key] = svg_data
+                    return svg_data
+                else:
+                    # Remove stale error cache
+                    try:
+                        disk_file.unlink()
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
         # Generate fresh SVG
         svg_data = self.parser.render_svg(file_path, part_name, width, height)
 
-        # Store in caches
-        self._memory_cache[key] = svg_data
-        try:
-            disk_file.write_text(svg_data, encoding="utf-8")
-        except Exception:
-            pass
+        # Store in caches only if valid rendering (not a placeholder error)
+        if svg_data and "Render error" not in svg_data:
+            self._memory_cache[key] = svg_data
+            try:
+                disk_file.write_text(svg_data, encoding="utf-8")
+            except Exception:
+                pass
 
         return svg_data

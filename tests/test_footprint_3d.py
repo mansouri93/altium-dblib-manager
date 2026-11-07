@@ -586,6 +586,77 @@ class TestFootprint3D(unittest.TestCase):
         self.assertTrue(any(abs(z - (-0.1)) < 1e-3 for z in z_coords))
         self.assertTrue(any(abs(z - (-0.9)) < 1e-3 for z in z_coords))
 
+    def test_disk_caching_and_speedup(self):
+        """Verify 3D model disk caching loads from disk and bypasses re-parsing."""
+        if not self.cap_pcblib.exists():
+            self.skipTest("Capacitor 0402 PCBLIB not found")
+
+        fresh_parser = Footprint3DParser()
+        fresh_parser._cache.clear()
+        cache_file = fresh_parser._disk_cache_file(self.cap_pcblib, "CAP 0402_1005")
+        self.assertIsNotNone(cache_file)
+        self.assertTrue(cache_file.exists())
+
+        # Load using fresh parser (must read from disk cache)
+        model = fresh_parser.get_model(self.cap_pcblib, "CAP 0402_1005")
+        self.assertIsNotNone(model)
+        self.assertTrue(model.has_3d_model)
+        self.assertAlmostEqual(model.length_mm, 1.00, delta=0.08)
+        self.assertGreater(len(model.mesh_batches), 0)
+
+    def test_lazy_loading_and_background_worker(self):
+        """Verify 3D model is not loaded while in 2D mode, and loads upon switching to 3D."""
+        if not self.res_pcblib.exists():
+            self.skipTest("Resistor 0603 PCBLIB not found")
+
+        widget = FootprintPreviewWidget("Lazy Load Test")
+        widget.set_mode("2D")
+        self.assertEqual(widget.current_mode(), "2D")
+
+        widget.load_footprint(self.res_pcblib, "KOA RES RK73 RN73 0603_1608", "<svg></svg>")
+        # Model must be None in 2D mode (Lazy loading)
+        self.assertIsNone(widget.viewer_3d.model)
+
+        # Switch to 3D mode
+        widget.set_mode("3D")
+        self.assertIsNotNone(widget.viewer_3d.model)
+        self.assertAlmostEqual(widget.viewer_3d.model.length_mm, 1.60, delta=0.10)
+
+    def test_negative_rotation_svg_render(self):
+        """Verify negative pad rotation is normalized and generates valid SVG without pyaltiumlib errors."""
+        from app.altium.parser import AltiumParser
+        from PySide6.QtSvg import QSvgRenderer
+        from PySide6.QtCore import QByteArray
+
+        usb_pcblib = Path(r"altium-library-master\footprints\Connector - USB\PCB - CONNECTOR - USB - Amphenol ICC 10132328-10011LF.PcbLib")
+        if not usb_pcblib.exists():
+            self.skipTest("Amphenol ICC PCBLIB not found")
+
+        parser = AltiumParser()
+        svg_str = parser.render_svg(usb_pcblib, "Amphenol ICC 10132328-10011LF", width=500, height=500)
+        self.assertNotIn("Render error", svg_str)
+        self.assertNotIn("rotate(--", svg_str)
+
+        renderer = QSvgRenderer(QByteArray(svg_str.encode("utf-8")))
+        self.assertTrue(renderer.isValid())
+
+    def test_rapid_part_switching_thread_safety(self):
+        """Verify rapidly switching parts does not destroy active QThreads or cause crashes."""
+        if not self.cap_pcblib.exists() or not self.res_pcblib.exists():
+            self.skipTest("Test PCBLIB files not found")
+
+        widget = FootprintPreviewWidget("Thread Safety Test")
+        widget.set_mode("3D")
+
+        # Simulate rapid selections in succession
+        for _ in range(5):
+            widget.load_footprint(self.cap_pcblib, "CAP 0402_1005", "<svg></svg>")
+            widget.load_footprint(self.res_pcblib, "KOA RES RK73 RN73 0603_1608", "<svg></svg>")
+
+        # Let any queued events settle
+        app.processEvents()
+        self.assertIsNotNone(widget.viewer_3d.model)
+
 
 if __name__ == "__main__":
     unittest.main()

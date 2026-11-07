@@ -2,8 +2,10 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 import logging
+import hashlib
 import math
 from pathlib import Path
+import pickle
 import re
 from typing import Any
 import zlib
@@ -15,7 +17,7 @@ try:
 except ImportError:
     cascadio = None
     trimesh = None
-from ..config import to_absolute_path
+from ..config import to_absolute_path, CACHE_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -226,6 +228,21 @@ class Footprint3DParser:
 
     def __init__(self) -> None:
         self._cache: dict[str, Footprint3DModel] = {}
+        self.cache_dir = CACHE_DIR / "models_3d"
+        try:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            logger.warning(f"Could not initialize 3D cache directory {self.cache_dir}: {exc}")
+
+    def _disk_cache_file(self, pcb_path: Path, part_name: str) -> Path | None:
+        """Generate unique disk cache path based on absolute path, modification time, and part name."""
+        try:
+            mtime = pcb_path.stat().st_mtime_ns
+            raw = f"{str(pcb_path.resolve())}::{mtime}::{part_name}"
+            key = hashlib.md5(raw.encode("utf-8", errors="ignore")).hexdigest()
+            return self.cache_dir / f"{key}.cache"
+        except Exception:
+            return None
 
     def get_model(self, file_path: str | Path, part_name: str) -> Footprint3DModel:
         """Retrieve or parse 3D footprint model with bounding box and dimensions."""
@@ -237,8 +254,29 @@ class Footprint3DParser:
         if cache_key in self._cache:
             return self._cache[cache_key]
 
+        # 1. Try disk cache
+        cache_file = self._disk_cache_file(abs_path, part_name)
+        if cache_file and cache_file.exists():
+            try:
+                with open(cache_file, "rb") as f:
+                    model = pickle.load(f)
+                self._cache[cache_key] = model
+                return model
+            except Exception as exc:
+                logger.debug(f"Failed to read 3D cache for {part_name} from {cache_file}: {exc}")
+
+        # 2. Extract model
         model = self._extract_model(abs_path, part_name)
         self._cache[cache_key] = model
+
+        # 3. Store in disk cache
+        if cache_file:
+            try:
+                with open(cache_file, "wb") as f:
+                    pickle.dump(model, f, protocol=pickle.HIGHEST_PROTOCOL)
+            except Exception as exc:
+                logger.debug(f"Failed to write 3D cache for {part_name} to {cache_file}: {exc}")
+
         return model
 
     def _extract_model(self, pcb_path: Path, part_name: str) -> Footprint3DModel:

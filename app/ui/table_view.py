@@ -67,15 +67,27 @@ class ComponentsTableModel(QAbstractTableModel):
         self.current_table = table_name
         self.spacer_count = 0
         self.separator_title = ""
-        if table_name:
-            self.columns = self.db_manager.get_columns(table_name)
-            self.records = self.db_manager.fetch_records(table_name)
-            self.calculated_columns = self.db_manager.get_calculated_columns(table_name)
-        else:
+        try:
+            if table_name:
+                self.columns = self.db_manager.get_columns(table_name)
+                self.records = self.db_manager.fetch_records(table_name)
+                self.calculated_columns = self.db_manager.get_calculated_columns(table_name)
+            else:
+                self.columns = []
+                self.records = []
+                self.calculated_columns = set()
+        except Exception:
             self.columns = []
             self.records = []
             self.calculated_columns = set()
+            self.endResetModel()
+            raise
         self.endResetModel()
+
+    def clear_table(self) -> None:
+        """Clear all records and columns from the table model cleanly."""
+        self.load_table("")
+
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
         return len(self.records) + self.spacer_count

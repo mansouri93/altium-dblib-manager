@@ -765,7 +765,13 @@ class MainWindow(QMainWindow):
     def _on_category_selected(self, item: QListWidgetItem) -> None:
         table_name = item.text()
         logger.info(f"Category selected: {table_name}")
-        self.table_model.load_table(table_name)
+        try:
+            self.table_model.load_table(table_name)
+        except Exception as exc:
+            logger.error(f"Failed to load table '{table_name}': {exc}", exc_info=True)
+            self._handle_table_load_error(table_name, exc)
+            return
+
         count = len(self.table_model.records)
         self.lbl_record_count.setText(f"{count} component{'s' if count != 1 else ''}")
         restored = self._restore_current_table_column_layout()
@@ -775,6 +781,34 @@ class MainWindow(QMainWindow):
             self.warehouse_view.set_altium_context(table_name, self._get_displayed_altium_records())
         self.statusBar().showMessage(f"Loaded category: {table_name} ({count} items)")
         self._clear_previews()
+
+    def _handle_table_load_error(self, table_name: str, exc: Exception) -> None:
+        """Handle errors during category table loading gracefully without crashing."""
+        err_str = str(exc)
+        self.table_model.clear_table()
+        self.lbl_record_count.setText("0 components (Error)")
+        self.statusBar().showMessage(f"Error loading {table_name}")
+        self._clear_previews()
+
+        if "calculated column contains an invalid expression" in err_str.lower() or "-5617" in err_str:
+            reply = QMessageBox.critical(
+                self,
+                f"Formula Error in [{table_name}]",
+                f"Category <b>[{table_name}]</b> could not be loaded because a calculated column contains an invalid formula.<br><br>"
+                f"This happens when a column referenced in a formula was renamed, deleted, or mistyped.<br><br>"
+                f"<b>Technical Details:</b><br><code>{err_str}</code><br><br>"
+                f"Would you like to open <b>Manage Table Fields</b> now to inspect and fix the formula?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self._on_manage_table_schema(table_name)
+        else:
+            QMessageBox.critical(
+                self,
+                f"Error Loading Category [{table_name}]",
+                f"Failed to load category <b>[{table_name}]</b>:<br><br><code>{err_str}</code>",
+            )
 
     def _show_category_context_menu(self, pos) -> None:
         item = self.categories_list.itemAt(pos)
@@ -849,11 +883,15 @@ class MainWindow(QMainWindow):
 
     def _on_schema_changed(self, table_name: str) -> None:
         if self.table_model.current_table == table_name:
-            self.table_model.load_table(table_name)
-            restored = self._restore_current_table_column_layout()
-            if not restored:
-                self._auto_fit_columns()
-            self.lbl_record_count.setText(f"{len(self.table_model.records)} components")
+            try:
+                self.table_model.load_table(table_name)
+                restored = self._restore_current_table_column_layout()
+                if not restored:
+                    self._auto_fit_columns()
+                self.lbl_record_count.setText(f"{len(self.table_model.records)} components")
+            except Exception as exc:
+                logger.error(f"Failed to reload table '{table_name}' after schema change: {exc}", exc_info=True)
+                self._handle_table_load_error(table_name, exc)
 
     def _on_rename_category(self, old_name: str) -> None:
         new_name, ok = QInputDialog.getText(
